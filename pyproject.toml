@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "solana-sniper"
+version = "0.1.0"
+description = "Live Solana new-token discovery, scoring, sizing and manual-confirm execution engine"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+dependencies = [
+  "pydantic>=2.7",
+  "pydantic-settings>=2.3",
+  "httpx[http2]>=0.27",
+  "websockets>=12",
+  "sqlalchemy[asyncio]>=2.0",
+  "aiosqlite>=0.20",
+  "structlog>=24",
+  "rich>=13.7",
+  "typer>=0.12",
+  "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8",
+  "pytest-asyncio>=0.23",
+  "mypy>=1.10",
+  "ruff>=0.5",
+  "types-PyYAML",
+]
+
+[project.scripts]
+solana-sniper = "solana_sniper.cli.main:app"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+solana_sniper = ["py.typed"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "ASYNC", "RUF", "SIM", "N", "T20"]
+ignore = ["RUF012", "SIM108", "B008", "T201", "RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["T20"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+mypy_path = "src"
+packages = ["solana_sniper"]
+plugins = ["pydantic.mypy"]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+strict = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = ["error::RuntimeWarning"]

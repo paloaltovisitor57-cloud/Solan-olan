@@ -1,0 +1,191 @@
+# solana-sniper default configuration.
+# Every trading parameter lives here (or in env overrides: SNIPER_<SECTION>__<KEY>).
+# Secrets/API keys come from environment variables only - see .env.example.
+
+discovery:
+  sources: [pumpportal, geckoterminal]     # live sources; add dexscreener for profile-based discovery
+  max_token_age_s: 1800                    # ignore tokens older than 30 minutes
+  poll_interval_s: 5                       # REST discovery poll interval (pumpportal is a WebSocket)
+  max_tracked_tokens: 150
+  dedupe_ttl_s: 3600
+
+market_data:
+  sources: [dexscreener, pumpportal]
+  poll_interval_s: 1.5                     # DexScreener batch poll (30 mints/request, 300 req/min)
+  batch_size: 30
+  stale_after_s: 20                        # suppress signals when newest observation is older
+  trade_window_s: 300
+  buffer_seconds: 900
+  max_concurrent_requests: 6
+
+filters:
+  max_token_age_s: 1800
+  min_token_age_s: 15
+  min_liquidity_usd: 3000
+  max_liquidity_usd: 750000
+  min_volume_5m_usd: 500
+  min_buys_5m: 8
+  min_unique_traders: 6
+  max_top10_holder_pct: 0.45
+  max_largest_holder_pct: 0.18
+  require_mint_authority_revoked: true
+  require_freeze_authority_revoked: true
+  reject_transfer_fee_bps_over: 100
+  reject_transfer_hook: true
+  max_spread_bps: 1500
+  max_estimated_slippage_bps: 800
+  max_estimated_exit_slippage_bps: 1200
+  max_round_trip_loss_pct: 0.25
+  max_buy_ratio: 0.97
+  min_buy_ratio: 0.35
+  liquidity_drop_reject_pct: 0.40
+  unknown_policy: allow                    # allow | reject  (UNKNOWN checks never mean "safe")
+  max_unknown_checks: 3
+
+entry:
+  min_score: 65
+  min_observations: 4
+  min_momentum_30s: 0.0
+  min_momentum_60s: -0.05
+  min_trade_velocity_per_min: 6
+  min_volume_5m_usd: 500
+  ideal_buy_ratio: 0.72
+  signal_ttl_s: 45
+  cooldown_after_cancel_s: 120
+  cooldown_after_exit_s: 300
+  cooldown_after_reject_s: 900
+  freshness_half_life_s: 480
+  velocity_full_score_per_min: 60
+  momentum_full_score: 0.25
+  liquidity_growth_full_score: 0.30
+  max_pending_signals: 3
+  weights:
+    freshness: 12
+    liquidity_growth: 12
+    trade_velocity: 12
+    participation_growth: 10
+    momentum: 14
+    acceleration: 10
+    demand_balance: 8
+    concentration: 6
+    exit_viability: 10
+    slippage: 6
+
+risk:
+  profile: EXTREME                         # NORMAL | AGGRESSIVE | EXTREME
+  starting_bankroll_eur: 50
+  profiles:
+    NORMAL:     { base_fraction: 0.10, max_fraction: 0.20, max_total_exposure_fraction: 0.50, max_open_positions: 3 }
+    AGGRESSIVE: { base_fraction: 0.25, max_fraction: 0.45, max_total_exposure_fraction: 0.80, max_open_positions: 3 }
+    EXTREME:    { base_fraction: 0.50, max_fraction: 0.90, max_total_exposure_fraction: 0.95, max_open_positions: 2 }
+  hard_limits:
+    max_single_position_fraction: 0.95
+    max_total_exposure_fraction: 0.98
+    min_position_eur: 5
+    max_position_eur: 250000
+    max_fraction_of_pool_liquidity: 0.03
+    max_entry_price_impact_pct: 4.0
+  tiers:                                   # bankroll tiers: smaller bankroll -> higher % risk
+    - { name: micro, min_equity_eur: 0,      fraction_multiplier: 1.00 }
+    - { name: small, min_equity_eur: 300,    fraction_multiplier: 0.85 }
+    - { name: mid,   min_equity_eur: 1500,   fraction_multiplier: 0.65 }
+    - { name: large, min_equity_eur: 5000,   fraction_multiplier: 0.45 }
+    - { name: xl,    min_equity_eur: 25000,  fraction_multiplier: 0.30, max_open_positions: 3 }
+    - { name: whale, min_equity_eur: 100000, fraction_multiplier: 0.20, max_open_positions: 4 }
+  milestones_eur: [50, 100, 150, 300, 700, 1500, 3000, 5000, 10000, 25000, 50000, 100000, 300000]
+  confidence_min_score: 60
+  confidence_full_score: 90
+  confidence_min_multiplier: 0.5
+  drawdown_start: 0.15
+  drawdown_full: 0.50
+  drawdown_floor_multiplier: 0.35
+  streak_window: 10
+  loss_step_multiplier: 0.15
+  streak_min_multiplier: 0.40
+  win_step_multiplier: 0.08
+  streak_max_multiplier: 1.25
+  expectancy_negative_multiplier: 0.75
+  slippage_penalty_start_bps: 300
+  slippage_penalty_full_bps: 1000
+  slippage_penalty_floor: 0.5
+
+exit:
+  trailing:
+    tiers:                                 # trailing drawdown from peak by profit multiple
+      - { min_multiple: 0.0,  drawdown_pct: 0.30 }
+      - { min_multiple: 1.3,  drawdown_pct: 0.24 }
+      - { min_multiple: 1.8,  drawdown_pct: 0.18 }
+      - { min_multiple: 3.0,  drawdown_pct: 0.14 }
+      - { min_multiple: 5.0,  drawdown_pct: 0.10 }
+      - { min_multiple: 10.0, drawdown_pct: 0.07 }
+    reference_volatility: 0.06
+    max_volatility_widen: 1.5
+    low_liquidity_usd: 8000
+    low_liquidity_tighten: 0.7
+    negative_momentum_threshold: -0.05
+    negative_momentum_tighten: 0.8
+    duration_tighten_after_s: 600
+    duration_tighten: 0.85
+    min_drawdown_pct: 0.04
+    max_drawdown_pct: 0.50
+  momentum_window_s: 30
+  momentum_drop_threshold: -0.12
+  momentum_requires_prior_gain_pct: 0.10
+  liquidity_collapse_drop_pct: 0.35
+  liquidity_collapse_window_s: 60
+  volume_collapse_ratio: 0.15
+  volume_collapse_min_holding_s: 90
+  max_loss_pct: 0.35
+  max_holding_s: 1800
+  abnormal_price_spike_pct: 3.0
+  abnormal_spread_bps: 2000
+  stale_exit_after_s: 45
+  exit_signal_ttl_s: 30
+  exit_signal_cooldown_s: 10
+  min_holding_s_before_trailing: 5
+
+quotes:
+  source: jupiter
+  slippage_bps: 300
+  max_quote_age_s: 8
+  quote_timeout_s: 4
+  max_price_impact_pct: 6.0
+  round_trip_max_loss_pct: 0.25
+  refresh_interval_s: 3
+  prepare_unsigned_transaction: false      # needs providers.wallet_public_key (PUBLIC key only)
+  priority_fee_lamports: 200000
+  estimated_network_fee_lamports: 10000
+  extra_fill_slippage_bps: 50
+
+portfolio:
+  base_currency: EUR
+  sol_eur_fallback: 150
+  fx_refresh_s: 60
+  snapshot_interval_s: 15
+
+alerts:
+  terminal: true
+  min_urgency_for_push: HIGH
+
+storage:
+  database_url: sqlite+aiosqlite:///./data/sniper.db
+  write_batch_size: 200
+  write_flush_interval_s: 0.5
+  observation_retention_days: 14
+
+telemetry:
+  log_level: INFO
+  log_json: false
+  log_file: logs/sniper.log
+  metrics_interval_s: 30
+
+dry_run:
+  confirm_delay_s: 2
+  auto_confirm_buys: true
+  auto_confirm_sells: true
+
+dashboard:
+  enabled: true
+  refresh_hz: 4
+  top_candidates: 8
+  event_lines: 14

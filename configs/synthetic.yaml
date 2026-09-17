@@ -1,0 +1,42 @@
+# Offline end-to-end configuration: identical engine, but discovery/market data/quotes come from
+# the built-in synthetic launch simulator. Use for debugging the pipeline without network access.
+discovery:
+  sources: [synthetic]
+  max_token_age_s: 1800
+  poll_interval_s: 1
+market_data:
+  sources: [synthetic]
+  poll_interval_s: 0.5
+  stale_after_s: 10
+quotes:
+  source: synthetic
+  slippage_bps: 300
+  max_quote_age_s: 8
+filters:
+  min_token_age_s: 5
+  min_liquidity_usd: 2000
+  min_volume_5m_usd: 300
+  min_buys_5m: 5
+  min_unique_traders: 4
+entry:
+  min_score: 60
+  min_observations: 4
+  min_trade_velocity_per_min: 4
+  signal_ttl_s: 30
+exit:
+  max_holding_s: 240
+  trailing:
+    tiers:
+      - { min_multiple: 0.0, drawdown_pct: 0.25 }
+      - { min_multiple: 1.5, drawdown_pct: 0.18 }
+      - { min_multiple: 3.0, drawdown_pct: 0.12 }
+risk:
+  profile: EXTREME
+  starting_bankroll_eur: 50
+storage:
+  database_url: sqlite+aiosqlite:///./data/sniper-synthetic.db
+dry_run:
+  confirm_delay_s: 1
+dashboard:
+  enabled: true
+  refresh_hz: 4

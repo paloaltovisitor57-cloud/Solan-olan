@@ -339,6 +339,8 @@ class Engine:
             self._error("tick", exc)
         finally:
             self.d.metrics.observe("engine_tick", (time.perf_counter() - started) * 1000.0)
+        # Give spawned quote/metadata tasks a chance to run before the next tick.
+        await asyncio.sleep(0)
 
     async def _refresh_fx(self, now: datetime) -> None:
         if (

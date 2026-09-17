@@ -13,7 +13,7 @@ from tests.integration.conftest import Harness
 async def test_confirm_buy_requotes_when_signal_quote_is_old(harness: Harness) -> None:
     engine = harness.engine
     ex = engine.d.execution
-    ex._auto_buys = False  # type: ignore[attr-defined]  # noqa: SLF001
+    ex._auto_buys = False  # type: ignore[attr-defined]
     for _ in range(400):
         await harness.step(0.5)
         if ex.pending():
@@ -39,8 +39,14 @@ async def test_confirm_buy_requotes_when_signal_quote_is_old(harness: Harness) -
 async def test_repo_get_token_roundtrip(harness: Harness) -> None:
     repo = harness.runtime.repo
     token = TokenInfo(
-        mint="ABC", symbol="A", name="Alpha", decimals=9, venue=Venue.RAYDIUM, source="test",
-        discovered_at=harness.clock.now(), pool_address="pool",
+        mint="ABC",
+        symbol="A",
+        name="Alpha",
+        decimals=9,
+        venue=Venue.RAYDIUM,
+        source="test",
+        discovered_at=harness.clock.now(),
+        pool_address="pool",
     )
     repo.save_token(token)
     await repo.flush()

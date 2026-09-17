@@ -37,7 +37,7 @@ class EntryGate:
         if not ok:
             reasons.append(why)
         if score.score < self._cfg.min_score:
-            reasons.append(f"score {score.score:.0f} < {self._cfg.min_score:.0f}")
+            reasons.append(f"score {score.score:.1f} < {self._cfg.min_score:.0f}")
         if features.momentum_30s is not None and features.momentum_30s < self._cfg.min_momentum_30s:
             reasons.append(f"momentum30 {features.momentum_30s:+.1%}")
         if features.momentum_60s is not None and features.momentum_60s < self._cfg.min_momentum_60s:

@@ -7,6 +7,7 @@ recorded price with a conservative impact model, so signal logic can still be ex
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -208,9 +209,13 @@ async def replay_session(
             if clock.now() - last_tick >= tick_every:
                 last_tick = clock.now()
                 await engine.tick()
+                for _ in range(3):  # let spawned quote tasks complete within this step
+                    await asyncio.sleep(0)
         for _ in range(20):  # let pending confirmations/exits settle
             clock.advance(2)
             await engine.tick()
+            for _ in range(3):
+                await asyncio.sleep(0)
     finally:
         log_lines = list(engine.stats.recent)
         await runtime.bus.stop()

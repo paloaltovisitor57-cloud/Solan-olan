@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated
@@ -59,26 +60,39 @@ def run(
         float | None, typer.Option("--duration", help="Stop after N seconds (testing)")
     ] = None,
     seed: Annotated[int, typer.Option("--seed", help="Synthetic world seed")] = 7,
+    quiet: Annotated[
+        bool, typer.Option("--quiet", help="No per-event stdout (service mode)")
+    ] = False,
 ) -> None:
     """Start the live engine (signal mode) or --dry-run (same engine, simulated confirmations)."""
     settings = load_settings(config)
     mode = RunMode.DRY_RUN if dry_run else RunMode.LIVE
-    use_dashboard = settings.dashboard.enabled and not no_dashboard
+    use_dashboard = settings.dashboard.enabled and not no_dashboard and not quiet
     configure_logging(
         settings.telemetry.log_level,
         settings.telemetry.log_json,
         settings.telemetry.log_file,
         quiet_console=use_dashboard,
     )
-    asyncio.run(_run(settings, mode, use_dashboard, duration, seed))
+    try:
+        asyncio.run(_run(settings, mode, use_dashboard, duration, seed, quiet))
+    finally:
+        logging.shutdown()
 
 
 async def _run(
-    settings: object, mode: RunMode, use_dashboard: bool, duration: float | None, seed: int
+    settings: object,
+    mode: RunMode,
+    use_dashboard: bool,
+    duration: float | None,
+    seed: int,
+    quiet: bool = False,
 ) -> None:
     from solana_sniper.app.bootstrap import build_runtime
+    from solana_sniper.app.command_file import FileCommandSource
     from solana_sniper.cli.commands import CommandHandler, StdinReader
     from solana_sniper.cli.dashboard import Dashboard
+    from solana_sniper.config.paths import COMMANDS_FILE, state_path
     from solana_sniper.config.settings import Settings
 
     assert isinstance(settings, Settings)
@@ -112,9 +126,14 @@ async def _run(
     with contextlib.suppress(RuntimeError):
         reader.start()
     tasks.append(asyncio.create_task(handler.run(reader), name="commands"))
+    # headless confirmations: `./cmd.sh b 1` appends to the commands file
+    commands_path = state_path(settings.home, COMMANDS_FILE)
+    commands_file = FileCommandSource(commands_path)
+    tasks.append(asyncio.create_task(commands_file.run(handler.handle), name="file-commands"))
+    console.print(f"[dim]command file: {commands_path}[/]")
     if dashboard is not None:
         tasks.append(asyncio.create_task(dashboard.run(), name="dashboard"))
-    else:
+    elif not quiet:
         tasks.append(asyncio.create_task(_plain_status(runtime), name="status-printer"))
     waiter = asyncio.create_task(runtime.wait(), name="runtime-wait")
     try:
@@ -134,7 +153,7 @@ async def _run(
         await asyncio.gather(*tasks, return_exceptions=True)
         waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
-        await runtime.stop()
+        await runtime.stop(reason="signal" if stop.is_set() else "duration elapsed")
         snap = runtime.account.snapshot(runtime.clock.now())
         console.print(
             f"[bold]stopped[/] equity=€{q_display(snap.equity_eur)} cash=€{q_display(snap.cash_eur)} "
@@ -362,6 +381,169 @@ def sessions(config: ConfigOpt = None) -> None:
             console.print("no sessions recorded")
 
     asyncio.run(go())
+
+
+@app.command()
+def health(
+    config: ConfigOpt = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Print the raw heartbeat JSON")
+    ] = False,
+    quiet_check: Annotated[
+        bool, typer.Option("--quiet-check", help="Exit 0 only if fresh and healthy")
+    ] = False,
+) -> None:
+    """Show the running service's heartbeat (written every 5 s to <state>/status.json)."""
+    from solana_sniper.app.health import read_status, status_is_fresh
+    from solana_sniper.config.paths import STATUS_FILE, state_path
+
+    settings = load_settings(config)
+    path = state_path(settings.home, STATUS_FILE)
+    status = read_status(path)
+    if status is None:
+        if not quiet_check:
+            console.print(f"[yellow]no heartbeat at {path}[/] (service not started yet?)")
+        raise typer.Exit(code=2)
+    fresh = status_is_fresh(status)
+    healthy = bool(status.get("healthy")) and fresh
+    if quiet_check:
+        raise typer.Exit(code=0 if healthy else 1)
+    if json_output:
+        console.print_json(json.dumps(status, default=str))
+        raise typer.Exit(code=0 if healthy else 1)
+    _print_health(status, fresh, healthy)
+    raise typer.Exit(code=0 if healthy else 1)
+
+
+def _print_health(status: dict[str, object], fresh: bool, healthy: bool) -> None:
+    def num(v: object) -> str:
+        return f"{v:.0f}s ago" if isinstance(v, int | float) else "never"
+
+    written = status.get("written_at", "?")
+    if healthy:
+        state, color = "HEALTHY", "green"
+    elif status.get("stopped"):
+        state, color = "STOPPED", "yellow"
+    elif not fresh:
+        state, color = "STALE", "red"
+    else:
+        state, color = "DEGRADED", "yellow"
+    table = Table(title=f"heartbeat [{color}]{state}[/] @ {written}")
+    table.add_column("item")
+    table.add_column("value")
+    uptime = status.get("uptime_s")
+    table.add_row(
+        "process", f"pid {status.get('pid')} on {status.get('hostname')} mode {status.get('mode')}"
+    )
+    table.add_row("session", str(status.get("session_id")))
+    table.add_row("uptime", f"{uptime / 60:.1f} min" if isinstance(uptime, int | float) else "?")
+    engine = status.get("engine") or {}
+    assert isinstance(engine, dict)
+    table.add_row(
+        "engine tick",
+        f"p50 {engine.get('tick_p50_ms')} ms  p95 {engine.get('tick_p95_ms')} ms  last {num(engine.get('last_tick_age_s'))}",
+    )
+    connections = status.get("connections") or {}
+    assert isinstance(connections, dict)
+    for name, conn in connections.items():
+        flag = "[green]connected[/]" if conn.get("connected") else "[red]disconnected[/]"
+        table.add_row(
+            f"connection {name}",
+            f"{flag} ({conn.get('kind')}) last activity {num(conn.get('last_activity_age_s'))}",
+        )
+    md = status.get("market_data") or {}
+    assert isinstance(md, dict)
+    table.add_row(
+        "market data",
+        f"{'[green]ok[/]' if md.get('ok') else '[red]stale[/]'}  watched {md.get('watched')}  "
+        f"snapshots/min {md.get('snapshots_last_minute')}  last {num(md.get('last_snapshot_age_s'))}  "
+        f"new tokens/s {md.get('discovery_rate_per_s')}",
+    )
+    db = status.get("database") or {}
+    assert isinstance(db, dict)
+    table.add_row(
+        "database",
+        f"{'[green]ok[/]' if db.get('ok') else '[red]error[/]'}  last flush {num(db.get('last_flush_age_s'))}  "
+        f"failures {db.get('failures')}  dropped {db.get('dropped')}  queued {db.get('queued')}"
+        + (f"  [red]{db.get('last_error')}[/]" if db.get("last_error") else ""),
+    )
+    table.add_row(
+        "tokens monitored",
+        f"{status.get('tokens_monitored')} (qualified {status.get('qualified')}, pending signals {status.get('pending_signals')})",
+    )
+    positions = status.get("open_positions") or []
+    assert isinstance(positions, list)
+    lines = [
+        f"{p.get('symbol') or str(p.get('mint', ''))[:8]} cost €{p.get('cost_eur')} value €{p.get('value_eur')} "
+        f"pnl {float(p.get('pnl_pct', 0)):+.0%} held {p.get('held_s')}s{' (stale data)' if p.get('data_stale') else ''}"
+        for p in positions
+    ]
+    table.add_row("open positions", "\n".join(lines) or "none")
+    table.add_row("last signal", str(status.get("last_signal_at") or "none yet"))
+    err = status.get("last_error")
+    table.add_row(
+        "last error",
+        f"{err.get('at')} {err.get('component')}: {err.get('message')}"
+        if isinstance(err, dict)
+        else "none",
+    )
+    pf = status.get("portfolio") or {}
+    assert isinstance(pf, dict)
+    table.add_row(
+        "portfolio",
+        f"equity €{pf.get('equity_eur')}  cash €{pf.get('cash_eur')}  exposure €{pf.get('open_exposure_eur')}  "
+        f"realized €{pf.get('realized_pnl_eur')}  dd {float(pf.get('drawdown_pct', 0)):.1%}  W/L {pf.get('wins')}/{pf.get('losses')}",
+    )
+    counters = status.get("counters") or {}
+    assert isinstance(counters, dict)
+    table.add_row("counters", ", ".join(f"{k} {v}" for k, v in counters.items()))
+    console.print(table)
+
+
+@app.command()
+def migrate(config: ConfigOpt = None) -> None:
+    """Apply pending database schema migrations (safe to run repeatedly)."""
+    from solana_sniper.storage.migrations import run_migrations, schema_version
+
+    settings = load_settings(config)
+    applied = asyncio.run(run_migrations(settings.storage.database_url))
+    version = asyncio.run(schema_version(settings.storage.database_url))
+    console.print(
+        f"database {settings.storage.database_url}: schema version {version}"
+        + (f", applied {applied}" if applied else ", nothing to apply")
+    )
+
+
+@app.command("config-check")
+def config_check(config: ConfigOpt = None) -> None:
+    """Load and validate configuration without touching the network; exit 1 on problems."""
+    try:
+        settings = load_settings(config)
+    except Exception as exc:
+        console.print(f"[red]configuration invalid:[/] {exc}")
+        raise typer.Exit(code=1) from None
+    problems: list[str] = []
+    if settings.risk.starting_bankroll_eur <= 0:
+        problems.append("risk.starting_bankroll_eur must be positive")
+    if settings.entry.min_score <= 0 or settings.entry.min_score > 100:
+        problems.append("entry.min_score must be in (0, 100]")
+    if not settings.discovery.sources:
+        problems.append("discovery.sources is empty")
+    if settings.quotes.prepare_unsigned_transaction and not settings.providers.wallet_public_key:
+        problems.append(
+            "quotes.prepare_unsigned_transaction needs providers.wallet_public_key (PUBLIC key)"
+        )
+    console.print(
+        f"config {settings.config_path or 'defaults'}  home {settings.home or '(cwd)'}  "
+        f"profile {settings.risk.profile}  bankroll €{settings.risk.starting_bankroll_eur}  "
+        f"sources {settings.discovery.sources}  quotes {settings.quotes.source}  "
+        f"db {settings.storage.database_url}  log {settings.telemetry.log_file}"
+    )
+    if problems:
+        for p in problems:
+            console.print(f"[red]- {p}[/]")
+        raise typer.Exit(code=1)
+    console.print("[green]configuration ok[/]")
 
 
 @app.command()

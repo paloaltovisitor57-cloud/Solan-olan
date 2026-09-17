@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
@@ -89,6 +89,7 @@ class PumpPortalClient:
     """Owns the socket; fans out create/trade messages to discovery and market-data consumers."""
 
     name = "pumpportal"
+    kind = "websocket"
 
     def __init__(
         self,
@@ -118,6 +119,13 @@ class PumpPortalClient:
         )
         self._task: asyncio.Task[None] | None = None
         self.messages_seen = 0
+        self._last_message_at: datetime | None = None
+
+    def is_connected(self) -> bool:
+        return self._ws.connected.is_set()
+
+    def last_activity(self) -> datetime | None:
+        return self._last_message_at
 
     def on_new_token(self, handler: EmitToken) -> None:
         self._token_handlers.append(handler)
@@ -160,6 +168,7 @@ class PumpPortalClient:
             if msg is None:
                 continue
             self.messages_seen += 1
+            self._last_message_at = datetime.now(tz=UTC)
             await self.dispatch(msg)
 
     async def dispatch(self, msg: dict[str, Any]) -> None:

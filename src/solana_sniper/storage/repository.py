@@ -130,6 +130,8 @@ class Repository:
         self._stopping = False
         self.dropped = 0
         self.failures = 0
+        self.last_flush_at: datetime | None = None
+        self.last_flush_error: str | None = None
 
     # ------------------------------------------------------------ lifecycle
     async def init(self) -> None:
@@ -185,9 +187,12 @@ class Repository:
                     await session.commit()
                 if self._metrics:
                     self._metrics.observe("storage_flush", (time.perf_counter() - started) * 1000)
+                self.last_flush_at = datetime.now(tz=UTC)
+                self.last_flush_error = None
                 return
             except SQLAlchemyError as exc:
                 self.failures += 1
+                self.last_flush_error = str(exc)[:200]
                 log.error("storage_batch_failed", attempt=attempt, ops=len(ops), error=str(exc))
                 await asyncio.sleep(0.2)
         # second failure: try ops individually so one bad row does not poison the batch
@@ -199,6 +204,10 @@ class Repository:
             except SQLAlchemyError as exc:
                 self.dropped += 1
                 log.error("storage_op_dropped", error=str(exc))
+
+    @property
+    def queue_size(self) -> int:
+        return self._queue.qsize()
 
     def persist(self, op: WriteOp) -> None:
         try:

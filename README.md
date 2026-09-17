@@ -245,6 +245,74 @@ milestones, execution_records, state_transitions, errors. On startup the account
 market data and monitored again. `replay SESSION_ID` feeds the recorded stream into a fresh
 engine on a manual clock and writes to `<db>-replay.db`.
 
+## MACOS PLUG-AND-PLAY SETUP
+
+One-time setup on an always-on Mac; afterwards the engine runs as a launchd user agent that
+survives closed Terminals, restarts after crashes and needs no Claude Code session.
+
+```bash
+git clone <repo-url> Solan-olan
+cd Solan-olan
+./install-macos.sh
+```
+
+`install-macos.sh` verifies Python ≥ 3.12 (`brew install python@3.12` if missing), creates
+`.venv`, installs dependencies, creates the runtime home, validates the configuration, applies
+database migrations, runs the test suite, renders and installs
+`~/Library/LaunchAgents/com.solanasniper.agent.plist`, bootstraps it and waits for a healthy
+heartbeat. It is safe to re-run.
+
+**Runtime state lives outside the repository** (never committed):
+
+```
+~/Library/Application Support/SolanaSniper/
+  db/         sniper.db (SQLite, WAL)            — portfolio, positions, ledger, observations
+  logs/       sniper.log (rotating), service.out.log, service.err.log
+  state/      status.json (heartbeat, every 5 s), commands (headless confirmations)
+  sniper.env  local secrets/config (mode 600): API keys, SNIPER_SERVICE_MODE, overrides
+```
+
+`SNIPER_HOME` points there for the service and every script; `data/`, `.env` and `sniper.env`
+are git-ignored. Put API keys (Helius, Jupiter, Discord/Telegram, wallet **public** key) in
+`sniper.env`; the format is the same as `.env.example`.
+
+**Deployment mode.** The service runs `solana-sniper run --dry-run --no-dashboard --quiet` by
+default: live Solana data, real signals, simulated confirmations. Set `SNIPER_SERVICE_MODE=signal`
+in `sniper.env` (or `./install-macos.sh --mode signal`) for live signal mode, where *you* confirm
+each BUY/SELL: `./cmd.sh b 1`, `./cmd.sh s 2`, `./cmd.sh r 1`, `./cmd.sh i 2`, or
+`./cmd.sh b 1 0.12 950000 <txsig>` to record the actual fill you executed in your own wallet.
+There is no mode that signs or broadcasts transactions.
+
+**Commands**
+
+| Script | What it does |
+|---|---|
+| `./start.sh` | (re)render the plist, bootstrap and kickstart the agent, wait for a healthy heartbeat |
+| `./stop.sh` | `launchctl bootout` → SIGTERM → the engine flushes storage, portfolio state, open positions, logs |
+| `./restart.sh` | stop + start; open positions are restored from the database and monitoring resumes |
+| `./status.sh` | launchd state + PID, uptime, connection status per provider, market-data freshness, database health, tokens monitored, open positions, last signal, last error |
+| `./logs.sh [-n N] [app\|out\|err\|all]` | follow the rotating app log and launchd stdout/stderr |
+| `./cmd.sh <command>` | queue a confirmation for the headless service (`b N`, `s N`, `r N`, `i N`, `p`, `c`) |
+| `./update.sh` | fast-forward pull, reinstall deps, `config-check`, `migrate`, run tests; restarts the service **only** if every step passes |
+| `./doctor.sh` | verifies python, venv, directories, env file permissions, git-ignore, plist validity, launchd state, heartbeat, then runs `solana-sniper doctor` (config, db, network, providers, quotes) |
+
+**launchd behaviour.** `RunAtLoad` starts the agent at login; `KeepAlive.SuccessfulExit=false`
+restarts it after a crash (non-zero exit) with a 10 s throttle but leaves it stopped after
+`./stop.sh`; `ExitTimeOut=30` gives the graceful shutdown time to flush; stdout/stderr go to
+`logs/service.*.log`. Because it is a *user* agent it runs while your user is logged in; for an
+always-on Mac enable automatic login and disable sleep (`sudo pmset -a sleep 0`).
+
+**Crash/restart recovery.** Every fill, position, ledger entry and account snapshot is written
+synchronously before the engine continues; on start the portfolio and open positions are rebuilt
+from the database, re-subscribed to market data and monitored again (`restored open position …`
+appears in the log). Pending confirmations do not survive a restart and are regenerated live.
+
+**Verification status.** The scripts were developed and exercised on Linux with a mocked
+`launchctl`/`plutil`/`uname` (full install → start → status → cmd → stop → restart flow, plist
+rendering validated with `plistlib`), plus `shellcheck` and `bash -n`. They have **not** been run
+on a real macOS machine from this environment; `./doctor.sh` and `./status.sh` will show
+immediately if launchd or a provider is unhappy on your Mac.
+
 ## 12. Quality gates
 
 ```bash

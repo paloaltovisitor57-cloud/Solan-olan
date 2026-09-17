@@ -56,6 +56,8 @@ ignore = ["RUF012", "SIM108", "B008", "T201", "RUF001", "RUF002", "RUF003"]
 "src/solana_sniper/cli/main.py" = ["E501"]
 "src/solana_sniper/cli/commands.py" = ["E501"]
 "src/solana_sniper/app/doctor.py" = ["E501"]
+# embeds shell scripts for the mocked-launchd deployment test
+"tests/integration/test_scripts.py" = ["E501"]
 
 [tool.mypy]
 python_version = "3.12"

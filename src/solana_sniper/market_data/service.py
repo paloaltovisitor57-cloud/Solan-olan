@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
+from datetime import UTC, datetime
 
 from solana_sniper.config.settings import MarketDataConfig
 from solana_sniper.domain.clock import Clock
@@ -42,6 +43,21 @@ class MarketDataService:
         self._tracked: dict[str, TokenInfo] = {}
         self._sem = asyncio.Semaphore(max(1, config.max_concurrent_requests))
         self.polls = 0
+        self.name = "market-data"
+        self.kind = "http-poll"
+        self._last_success_at: datetime | None = None
+
+    def is_connected(self) -> bool:
+        """True when a poll succeeded recently (or no polling provider is configured)."""
+        if not self._polling:
+            return True
+        if self._last_success_at is None:
+            return False
+        age = (datetime.now(tz=UTC) - self._last_success_at).total_seconds()
+        return age <= max(10.0, self._config.poll_interval_s * 4)
+
+    def last_activity(self) -> datetime | None:
+        return self._last_success_at
 
     def add_polling(self, provider: PollingMarketDataProvider) -> None:
         self._polling.append(provider)
@@ -99,6 +115,8 @@ class MarketDataService:
                     self._metrics.inc("provider_errors")
                     log.warning("market_poll_error", provider=provider.name, error=str(exc))
                     return
+            if snaps:
+                self._last_success_at = datetime.now(tz=UTC)
             for snap in snaps:
                 await self._emit_snapshot(snap)
 

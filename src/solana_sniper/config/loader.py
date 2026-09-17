@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from solana_sniper.config.paths import DB_DIR, ENV_FILE, LOG_DIR, configured_home, ensure_home
 from solana_sniper.config.settings import Settings
 
 DEFAULT_CONFIG_ENV = "SNIPER_CONFIG"
@@ -69,6 +70,28 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
             # highest priority first
             return (env_settings, dotenv_settings, yaml_source, init_settings)
 
-    settings = _YamlSettings()
+    home = configured_home()
+    env_files: list[str] = [".env"]
+    if home is not None:
+        ensure_home(home)
+        env_files.append(str(home / ENV_FILE))
+    settings = _YamlSettings(_env_file=env_files)
     settings.config_path = path
+    settings.home = home
+    if home is not None:
+        apply_home(settings, home)
     return settings
+
+
+DEFAULT_DB_PREFIX = "sqlite+aiosqlite:///./"
+
+
+def apply_home(settings: Settings, home: Path) -> None:
+    """Relocate relative database/log paths under SNIPER_HOME. Absolute paths are respected."""
+    url = settings.storage.database_url
+    if url.startswith(DEFAULT_DB_PREFIX):
+        name = Path(url.removeprefix(DEFAULT_DB_PREFIX)).name
+        settings.storage.database_url = f"sqlite+aiosqlite:///{home / DB_DIR / name}"
+    log_file = settings.telemetry.log_file
+    if log_file and not Path(log_file).is_absolute():
+        settings.telemetry.log_file = str(home / LOG_DIR / Path(log_file).name)

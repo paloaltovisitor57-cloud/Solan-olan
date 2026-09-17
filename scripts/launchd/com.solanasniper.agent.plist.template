@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>@@LABEL@@</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>@@BIN@@</string>
+@@ARGS@@
+    </array>
+    <key>WorkingDirectory</key>
+    <string>@@REPO_DIR@@</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>SNIPER_HOME</key>
+        <string>@@SNIPER_HOME@@</string>
+        <key>SNIPER_CONFIG</key>
+        <string>@@SNIPER_CONFIG@@</string>
+        <key>PATH</key>
+        <string>@@PATH@@</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>LC_ALL</key>
+        <string>en_US.UTF-8</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <dict>
+        <!-- restart after a crash (non-zero exit); stay stopped after a clean exit or ./stop.sh -->
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ExitTimeOut</key>
+    <integer>30</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>@@STDOUT@@</string>
+    <key>StandardErrorPath</key>
+    <string>@@STDERR@@</string>
+</dict>
+</plist>

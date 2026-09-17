@@ -21,7 +21,9 @@ from solana_sniper.alerts.terminal import TerminalAlertProvider
 from solana_sniper.alerts.webhooks import DiscordAlertProvider, TelegramAlertProvider
 from solana_sniper.app.bus import EventBus
 from solana_sniper.app.engine import Engine, EngineDeps
+from solana_sniper.app.health import ConnectionProbe, HealthReporter
 from solana_sniper.app.persistence import PersistenceSubscriber
+from solana_sniper.config.paths import STATUS_FILE, state_path
 from solana_sniper.config.settings import Settings
 from solana_sniper.discovery.dexscreener import DexScreenerDiscovery
 from solana_sniper.discovery.geckoterminal import GeckoTerminalDiscovery
@@ -93,6 +95,7 @@ class Runtime:
     background: list[tuple[str, Task]] = field(default_factory=list)
     synthetic_world: SyntheticWorld | None = None
     quote_provider: QuoteProvider | None = None
+    health: HealthReporter | None = None
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
 
     async def start(self) -> None:
@@ -104,6 +107,8 @@ class Runtime:
         for name, task in self.background:
             self._tasks.append(asyncio.create_task(task(), name=name))
         self._tasks.append(asyncio.create_task(self.engine.run(), name="engine"))
+        if self.health is not None:
+            self._tasks.append(asyncio.create_task(self.health.run(), name="health"))
 
     async def _restore_account(self) -> None:
         state = await self.repo.load_state()
@@ -150,7 +155,8 @@ class Runtime:
             if t.exception() is not None and not isinstance(t.exception(), asyncio.CancelledError):
                 log.error("task_crashed", task=t.get_name(), error=str(t.exception()))
 
-    async def stop(self) -> None:
+    async def stop(self, reason: str = "shutdown") -> None:
+        """Graceful shutdown: stop tasks, drain the bus, flush storage, persist portfolio state."""
         self.engine.stop()
         for t in self._tasks:
             t.cancel()
@@ -176,6 +182,8 @@ class Runtime:
             await self.repo.end_session()
         await self.repo.close()
         await self.http.aclose()
+        if self.health is not None:
+            self.health.write_final(reason)
 
     def install_signal_handlers(self, on_stop: Callable[[], None]) -> None:
         loop = asyncio.get_running_loop()
@@ -256,6 +264,7 @@ def build_runtime(
     )
     discovery = DiscoveryService(settings.discovery, clock, metrics, emit_token)
     background: list[tuple[str, Task]] = []
+    probes: list[ConnectionProbe] = []
 
     # ---- providers
     world: SyntheticWorld | None = None
@@ -291,6 +300,7 @@ def build_runtime(
                 max_backoff_s=settings.providers.ws_reconnect_max_s,
             )
             background.append(("pumpportal-ws", pump.run))
+            probes.append(pump)
         dex_md = DexScreenerMarketData(
             http, settings.providers.dexscreener_base_url, clock, settings.market_data.batch_size
         )
@@ -418,7 +428,7 @@ def build_runtime(
 
     background.append(("discovery", discovery.run))
     background.append(("market-data", market.run))
-    return Runtime(
+    runtime = Runtime(
         settings=settings,
         mode=mode,
         session_id=sid,
@@ -437,3 +447,15 @@ def build_runtime(
         synthetic_world=world,
         quote_provider=quote_provider,
     )
+    if mode is not RunMode.REPLAY:
+        health = HealthReporter(
+            runtime,
+            state_path(settings.home, STATUS_FILE),
+            stale_after_s=settings.market_data.stale_after_s,
+        )
+        for probe in probes:
+            health.add_probe(probe)
+        health.add_probe(market)
+        health.add_probe(discovery)
+        runtime.health = health
+    return runtime

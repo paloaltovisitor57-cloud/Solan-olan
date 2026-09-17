@@ -376,7 +376,12 @@ class Settings(BaseSettings):
     dry_run: DryRunConfig = DryRunConfig()
     dashboard: DashboardConfig = DashboardConfig()
     config_path: Path | None = Field(default=None, exclude=True)
+    home: Path | None = Field(default=None, exclude=True)  # SNIPER_HOME, if configured
 
     @property
     def is_synthetic(self) -> bool:
         return self.discovery.sources == ["synthetic"]
+
+    @property
+    def state_dir(self) -> Path:
+        return (self.home / "state") if self.home else Path("data") / "state"

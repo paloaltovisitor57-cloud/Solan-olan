@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
-from datetime import datetime
+from datetime import UTC, datetime
 
 from solana_sniper.config.settings import DiscoveryConfig
 from solana_sniper.discovery.base import PollingDiscoveryProvider, TokenDiscoveryProvider
@@ -34,6 +34,20 @@ class DiscoveryService:
         self.accepted = 0
         self.skipped_old = 0
         self.duplicates = 0
+        self.name = "discovery"
+        self.kind = "http-poll"
+        self._last_success_at: datetime | None = None
+
+    def is_connected(self) -> bool:
+        if not self._polling:
+            return True  # streaming providers report their own connection state
+        if self._last_success_at is None:
+            return False
+        age = (datetime.now(tz=UTC) - self._last_success_at).total_seconds()
+        return age <= max(30.0, self._config.poll_interval_s * 4)
+
+    def last_activity(self) -> datetime | None:
+        return self._last_success_at
 
     def add_streaming(self, provider: TokenDiscoveryProvider) -> None:
         self._streaming.append(provider)
@@ -72,6 +86,8 @@ class DiscoveryService:
         while True:
             try:
                 tokens = await provider.poll()
+
+                self._last_success_at = datetime.now(tz=UTC)
                 for token in tokens:
                     await self.handle(token)
             except asyncio.CancelledError:

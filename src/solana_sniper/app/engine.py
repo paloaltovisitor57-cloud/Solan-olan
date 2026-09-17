@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 import time
 import traceback
+from collections import deque
 from collections.abc import Coroutine
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -177,6 +178,8 @@ class EngineStats:
     exits: int = 0
     evaluations: int = 0
     recent: list[str] = field(default_factory=list)
+    last_signal_at: datetime | None = None
+    last_error: ErrorRecord | None = None
 
 
 class Engine:
@@ -199,6 +202,9 @@ class Engine:
         self._last_snapshot_at: datetime | None = None
         self._last_fx_at: datetime | None = None
         self.started_at: datetime | None = None
+        self.last_tick_at: datetime | None = None
+        self.last_snapshot_at: datetime | None = None
+        self._snapshot_times: deque[datetime] = deque(maxlen=20_000)
 
     # ------------------------------------------------------------------ utils
     @property
@@ -230,6 +236,7 @@ class Engine:
             session_id=self.session_id,
         )
         log.error("engine_error", component=component, error=message)
+        self.stats.last_error = rec
         self.d.bus.publish(ErrorOccurred(rec))
 
     def _transition(self, cand: Candidate, target: CandidateState, reason: str) -> bool:
@@ -286,6 +293,8 @@ class Engine:
         if track is None:
             return
         self.d.metrics.inc("snapshots")
+        self.last_snapshot_at = snap.observed_at
+        self._snapshot_times.append(snap.observed_at)
         self.timer.mark(snap.mint, "first_data")
         cand = self.candidates.get(snap.mint)
         if cand is not None:
@@ -338,6 +347,7 @@ class Engine:
         except Exception as exc:
             self._error("tick", exc)
         finally:
+            self.last_tick_at = now
             self.d.metrics.observe("engine_tick", (time.perf_counter() - started) * 1000.0)
         # Give spawned quote/metadata tasks a chance to run before the next tick.
         await asyncio.sleep(0)
@@ -697,6 +707,7 @@ class Engine:
             return
         cand.signal, cand.order = signal, order
         self.stats.signals += 1
+        self.stats.last_signal_at = now
         self.d.metrics.inc("signals_generated")
         self.timer.mark(cand.mint, "signal")
         self.d.repo.save_signal(signal, str(SignalStatus.PENDING))
@@ -963,6 +974,7 @@ class Engine:
             return
         cand.sell_order = order
         self.stats.exits += 1
+        self.stats.last_signal_at = now
         self.d.metrics.inc("exit_signals")
         self.d.repo.save_signal(signal, str(SignalStatus.PENDING))
         self.d.bus.publish(SellSignalCreated(signal))
@@ -1160,6 +1172,10 @@ class Engine:
             )
 
     # ------------------------------------------------------------------ view
+    def snapshots_last_minute(self, now: datetime) -> int:
+        cutoff = now - timedelta(seconds=60)
+        return sum(1 for t in self._snapshot_times if t >= cutoff)
+
     def open_positions(self) -> list[Position]:
         return self.d.account.open_positions
 

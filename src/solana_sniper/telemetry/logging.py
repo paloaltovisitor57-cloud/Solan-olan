@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import structlog
@@ -24,7 +25,11 @@ def configure_logging(
         handlers.append(logging.StreamHandler(sys.stderr))
     if log_file:
         Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
+        handlers.append(
+            RotatingFileHandler(
+                log_file, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8"
+            )
+        )
     root = logging.getLogger()
     for h in list(root.handlers):
         root.removeHandler(h)

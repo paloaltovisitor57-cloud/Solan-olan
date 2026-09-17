@@ -1,1 +1,1 @@
-"""cli package."""
+"""Command line interface."""

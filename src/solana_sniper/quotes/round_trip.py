@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 
 from solana_sniper.config.settings import QuotesConfig
@@ -34,6 +35,7 @@ class RoundTripEvaluator:
         now = self._clock.now()
         lamports = sol_to_lamports(spend_sol)
         reasons: list[str] = []
+        started = time.perf_counter()
         buy = await self._provider.quote(WSOL, mint, lamports, self._cfg.slippage_bps)
         if self._metrics:
             self._metrics.inc("quotes")
@@ -70,6 +72,8 @@ class RoundTripEvaluator:
                 )
             if sell.price_impact_pct > self._cfg.max_price_impact_pct:
                 reasons.append(f"exit price impact {sell.price_impact_pct:.1f}%")
+        if self._metrics:
+            self._metrics.observe("quote_latency", (time.perf_counter() - started) * 1000.0)
         fees = buy.fee_lamports + (sell.fee_lamports if sell else 0)
         fees += 2 * (self._cfg.estimated_network_fee_lamports + self._cfg.priority_fee_lamports)
         return RoundTripQuote(

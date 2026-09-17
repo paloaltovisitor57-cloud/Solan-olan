@@ -93,6 +93,7 @@ risk:
     - { name: xl,    min_equity_eur: 25000,  fraction_multiplier: 0.30, max_open_positions: 3 }
     - { name: whale, min_equity_eur: 100000, fraction_multiplier: 0.20, max_open_positions: 4 }
   milestones_eur: [50, 100, 150, 300, 700, 1500, 3000, 5000, 10000, 25000, 50000, 100000, 300000]
+  milestone_hysteresis_pct: 0.05           # a DOWN crossing needs equity 5% below the level
   confidence_min_score: 60
   confidence_full_score: 90
   confidence_min_multiplier: 0.5

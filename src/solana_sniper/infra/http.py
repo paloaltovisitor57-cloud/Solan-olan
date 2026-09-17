@@ -145,7 +145,7 @@ class HttpClient:
                     headers=headers,
                     timeout=timeout_s if timeout_s is not None else httpx.USE_CLIENT_DEFAULT,
                 )
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError) as exc:
+            except httpx.TransportError as exc:  # timeouts, network, proxy, protocol errors
                 last_error = HttpError(
                     f"{method} {url}: {type(exc).__name__}: {exc}", retryable=True
                 )

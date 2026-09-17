@@ -40,7 +40,7 @@ class ProvidersConfig(BaseModel):
 
     @field_validator("wallet_public_key")
     @classmethod
-    def _no_private_key(cls, v: str | None) -> str | None:
+    def _reject_secret_material(cls, v: str | None) -> str | None:
         if v is None or v == "":
             return None
         # Solana public keys are 32-44 base58 chars. Private keys are 64 bytes / 87-88 chars
@@ -214,6 +214,7 @@ class RiskConfig(BaseModel):
         Decimal(x)
         for x in (50, 100, 150, 300, 700, 1500, 3000, 5000, 10000, 25000, 50000, 100000, 300000)
     ]
+    milestone_hysteresis_pct: float = 0.05  # DOWN fires only this far below a reached level
     confidence_min_score: float = 60.0
     confidence_full_score: float = 90.0
     confidence_min_multiplier: float = 0.5

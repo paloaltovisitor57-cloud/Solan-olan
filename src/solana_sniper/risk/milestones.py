@@ -9,10 +9,13 @@ from solana_sniper.domain.models import MilestoneEvent
 
 
 class MilestoneTracker:
-    def __init__(self, milestones: list[Decimal], session_id: str = "") -> None:
+    def __init__(
+        self, milestones: list[Decimal], session_id: str = "", hysteresis_pct: float = 0.05
+    ) -> None:
         self.milestones = sorted(set(milestones))
         self.reached: set[Decimal] = set()
         self.session_id = session_id
+        self._hysteresis = Decimal(str(hysteresis_pct))
 
     def restore(self, reached: list[Decimal]) -> None:
         self.reached = {m for m in reached if m in self.milestones}
@@ -41,7 +44,7 @@ class MilestoneTracker:
                         session_id=self.session_id,
                     )
                 )
-            elif equity < m and m in self.reached:
+            elif equity < m * (1 - self._hysteresis) and m in self.reached:
                 self.reached.discard(m)
                 events.append(
                     MilestoneEvent(

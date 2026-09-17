@@ -92,7 +92,9 @@ class EntryScorer:
                 w.participation_growth,
                 f"{part:+.0%} traders/60s",
             )
-            if part > 0.15:
+            if part > 3.0:
+                reasons.append("unique participation surging")
+            elif part > 0.15:
                 reasons.append(f"unique participation growing {part:+.0%}")
 
         m30, m60 = f.momentum_30s, f.momentum_60s

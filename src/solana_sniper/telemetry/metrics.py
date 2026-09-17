@@ -58,10 +58,11 @@ class Metrics:
         "discovery_to_first_data",
         "data_to_features",
         "features_to_signal",
-        "signal_to_quote",
+        "qualified_to_quote",
         "quote_latency",
         "provider_latency",
         "storage_flush",
+        "engine_tick",
     )
 
     def __init__(self) -> None:
@@ -120,7 +121,7 @@ class PipelineTimer:
             "first_data": ("discovered", "discovery_to_first_data"),
             "features": ("first_data", "data_to_features"),
             "signal": ("features", "features_to_signal"),
-            "quote": ("signal", "signal_to_quote"),
+            "quote": ("qualified", "qualified_to_quote"),
         }
         if stage in pairs:
             prev, metric = pairs[stage]

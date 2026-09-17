@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from solana_sniper.domain.enums import Venue
 from solana_sniper.domain.models import (
     BuySignal,
     CheckReport,
@@ -771,6 +772,31 @@ class Repository:
             ],
             "observations": obs_count,
         }
+
+    async def get_token(self, mint: str) -> TokenInfo | None:
+        async with self._sessions() as s:
+            row = (
+                await s.execute(select(TokenRow).where(TokenRow.mint == mint))
+            ).scalar_one_or_none()
+        if row is None:
+            return None
+        try:
+            venue = Venue(row.venue)
+        except ValueError:
+            venue = Venue.UNKNOWN
+        return TokenInfo(
+            mint=row.mint,
+            symbol=row.symbol,
+            name=row.name,
+            decimals=row.decimals,
+            created_at=_aware(row.created_at) if row.created_at else None,
+            pool_created_at=_aware(row.pool_created_at) if row.pool_created_at else None,
+            venue=venue,
+            pool_address=row.pool_address,
+            quote_mint=row.quote_mint,
+            source=row.source,
+            discovered_at=_aware(row.discovered_at) if row.discovered_at else None,
+        )
 
     async def list_sessions(self, limit: int = 20) -> list[dict[str, Any]]:
         async with self._sessions() as s:

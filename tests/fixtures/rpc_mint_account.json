@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":1,"result":{"context":{"slot":300000000},"value":{"data":{"parsed":{"info":{"decimals":6,"freezeAuthority":null,"isInitialized":true,"mintAuthority":null,"supply":"999999999000000"},"type":"mint"},"program":"spl-token","space":82},"executable":false,"lamports":1461600,"owner":"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA","rentEpoch":0}}}

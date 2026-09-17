@@ -1,1 +1,1 @@
-"""market_data package."""
+"""Live market data providers, tracker and service."""

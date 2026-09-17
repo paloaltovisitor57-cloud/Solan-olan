@@ -215,6 +215,7 @@ class CheckResult:
     reason: str
     observed_at: datetime
     value: str | None = None
+    fatal: bool = False  # a fatal REJECT ends the candidate; non-fatal means "not (yet) qualified"
 
 
 @dataclass(frozen=True, slots=True)
@@ -235,6 +236,19 @@ class CheckReport:
     @property
     def rejections(self) -> tuple[CheckResult, ...]:
         return tuple(r for r in self.results if r.verdict is CheckVerdict.REJECT)
+
+    @property
+    def fatal_rejections(self) -> tuple[CheckResult, ...]:
+        return tuple(r for r in self.results if r.verdict is CheckVerdict.REJECT and r.fatal)
+
+    @property
+    def is_fatal(self) -> bool:
+        return bool(self.fatal_rejections)
+
+    def summary(self, limit: int = 4) -> str:
+        parts = [f"{r.name}:{r.reason}" for r in self.rejections[:limit]]
+        parts += [f"{r.name}:unknown" for r in self.unknowns[: max(0, limit - len(parts))]]
+        return ", ".join(parts) if parts else "all checks passed"
 
     @property
     def unknowns(self) -> tuple[CheckResult, ...]:

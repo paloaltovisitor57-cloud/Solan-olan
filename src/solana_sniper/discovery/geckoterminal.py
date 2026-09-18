@@ -16,7 +16,12 @@ from solana_sniper.discovery.parsing import (
 from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.enums import Venue
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo
-from solana_sniper.infra.http import HttpClient, HttpError
+from solana_sniper.infra.http import (
+    HttpClient,
+    HttpError,
+    ProviderUnavailableError,
+    RateLimitedError,
+)
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.redaction import safe_exception
 
@@ -143,6 +148,10 @@ class GeckoTerminalDiscovery:
                     params={"page": page},
                     headers={"accept": "application/json;version=20230302"},
                 )
+            except (RateLimitedError, ProviderUnavailableError):
+                if found:
+                    break  # keep what the earlier pages returned
+                raise
             except HttpError as exc:
                 log.warning("geckoterminal_poll_failed", error=safe_exception(exc))
                 break

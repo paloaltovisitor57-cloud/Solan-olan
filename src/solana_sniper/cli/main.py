@@ -6,7 +6,11 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import subprocess
 from collections.abc import Callable
+from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Annotated
 
@@ -15,6 +19,7 @@ from rich.console import Console
 from rich.table import Table
 
 from solana_sniper import __version__
+from solana_sniper.app.paper import PaperSession
 from solana_sniper.config import load_settings
 from solana_sniper.domain.enums import RunMode
 from solana_sniper.domain.money import q_display
@@ -39,8 +44,52 @@ def _settings(config: Path | None) -> object:
 
 
 @app.callback()
-def _root() -> None:
-    """solana-sniper."""
+def _root(
+    home: Annotated[
+        Path | None,
+        typer.Option(
+            "--home",
+            help="Runtime home (db/, logs/, state/, sniper.env). Default: $SNIPER_HOME, else the "
+            "platform home the service uses (macOS: ~/Library/Application Support/SolanaSniper).",
+            envvar="SNIPER_HOME",
+            show_envvar=True,
+        ),
+    ] = None,
+    paper_session: Annotated[
+        str | None,
+        typer.Option(
+            "--paper",
+            help="Read a paper session's database (id from `paper --list`) with status, "
+            "positions, portfolio, evaluate, inspect, sessions.",
+        ),
+    ] = None,
+) -> None:
+    """solana-sniper: live-data paper trading and signal research for new Solana tokens."""
+    if home is not None:
+        os.environ["SNIPER_HOME"] = str(home.expanduser())
+    if paper_session is not None:
+        from solana_sniper.app.paper import paper_db_path, paper_db_url
+        from solana_sniper.config.paths import configured_home
+
+        runtime_home = configured_home()
+        if not paper_db_path(runtime_home, paper_session).exists():
+            console.print(
+                f"[red]no paper session {paper_session!r} in {runtime_home / 'db' / 'paper'}[/]"
+            )
+            raise typer.Exit(code=2)
+        os.environ["SNIPER_STORAGE__DATABASE_URL"] = paper_db_url(runtime_home, paper_session)
+
+
+def _context_line(settings: object) -> str:
+    from solana_sniper.config.paths import home_source
+    from solana_sniper.config.settings import Settings
+
+    assert isinstance(settings, Settings)
+    return (
+        f"[dim]runtime home {settings.home} ({home_source()})  "
+        f"db {safe_url(settings.storage.database_url)}  "
+        f"config {settings.config_path or 'defaults'}[/]"
+    )
 
 
 @app.command()
@@ -88,21 +137,34 @@ async def _run(
     duration: float | None,
     seed: int,
     quiet: bool = False,
+    paper: object = None,
 ) -> None:
     from solana_sniper.app.bootstrap import build_runtime
     from solana_sniper.app.command_file import FileCommandSource
+    from solana_sniper.app.paper import PaperSession
+    from solana_sniper.app.report import build_session_report
     from solana_sniper.cli.commands import CommandHandler, StdinReader
     from solana_sniper.cli.dashboard import Dashboard
     from solana_sniper.config.paths import COMMANDS_FILE, state_path
     from solana_sniper.config.settings import Settings
 
     assert isinstance(settings, Settings)
-    runtime = build_runtime(settings, mode=mode, synthetic_seed=seed, quiet_alerts=False)
+    assert paper is None or isinstance(paper, PaperSession)
+    runtime = build_runtime(
+        settings,
+        mode=mode,
+        session_id=paper.session_id if paper is not None else None,
+        synthetic_seed=seed,
+        quiet_alerts=False,
+    )
+    runtime.paper = paper
     stop = asyncio.Event()
     dashboard: Dashboard | None = None
     say: Callable[[str], None]
     if use_dashboard:
-        dashboard = Dashboard(runtime.engine, settings.dashboard, console)
+        dashboard = Dashboard(
+            runtime.engine, settings.dashboard, console, paper=paper, runtime=runtime
+        )
         runtime.terminal_alerts.set_sink(dashboard.push_alert)
         say = dashboard.push_message
     else:
@@ -112,11 +174,15 @@ async def _run(
 
     runtime.install_signal_handlers(stop.set)
     await runtime.start()
-    console.print(
-        f"[bold]solana-sniper[/] {mode} session [cyan]{runtime.session_id}[/] "
-        f"sources={settings.discovery.sources} quotes={settings.quotes.source} "
-        f"bankroll=€{q_display(runtime.account.equity)}"
-    )
+    if paper is not None:
+        await runtime.repo.save_paper_session(paper)
+        _print_paper_banner(paper, runtime)
+    else:
+        console.print(
+            f"[bold]solana-sniper[/] {mode} session [cyan]{runtime.session_id}[/] "
+            f"sources={settings.discovery.sources} quotes={settings.quotes.source} "
+            f"bankroll=€{q_display(runtime.account.equity)}"
+        )
     if mode is RunMode.LIVE:
         console.print(
             "[bold red]LIVE SIGNAL MODE[/]: nothing is signed or broadcast. Confirm with b N / s N."
@@ -154,19 +220,350 @@ async def _run(
         await asyncio.gather(*tasks, return_exceptions=True)
         waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
-        await runtime.stop(reason="signal" if stop.is_set() else "duration elapsed")
-        snap = runtime.account.snapshot(runtime.clock.now())
+        reason = "Ctrl+C / signal" if stop.is_set() else "duration elapsed"
+        if paper is not None:
+            report = build_session_report(runtime, paper, reason=reason)
+        await runtime.stop(reason=reason)
+        if paper is not None:
+            console.print()
+            for line in report.lines():
+                style = "bold" if line.startswith("SESSION COMPLETE") else ""
+                if line.startswith("WARNING"):
+                    style = "bold red"
+                console.print(line, style=style, highlight=False)
+        else:
+            snap = runtime.account.snapshot(runtime.clock.now())
+            console.print(
+                f"[bold]stopped[/] equity=€{q_display(snap.equity_eur)} "
+                f"cash=€{q_display(snap.cash_eur)} "
+                f"realized=€{q_display(snap.realized_pnl_eur)} "
+                f"signals={runtime.engine.stats.signals} "
+                f"confirmed={runtime.engine.stats.confirmed} exits={runtime.engine.stats.exits} "
+                f"rejected={runtime.engine.stats.rejected}"
+            )
+            lat = runtime.metrics.latencies
+            console.print(
+                "latency ms: "
+                + "  ".join(
+                    f"{k}={v.summary()}" for k, v in lat.items() if v.summary().get("count")
+                )
+            )
+
+
+def _print_paper_banner(paper: object, runtime: object) -> None:
+    from solana_sniper.app.bootstrap import Runtime
+    from solana_sniper.app.paper import PaperSession
+
+    assert isinstance(paper, PaperSession) and isinstance(runtime, Runtime)
+    equity = runtime.account.equity
+    console.print()
+    console.print("[bold green]SOLANA SNIPER — PAPER[/]", highlight=False)
+    console.print("Mode:              PAPER / LIVE DATA", highlight=False)
+    console.print("[bold red]Real transactions: DISABLED[/] (no keys, no signing, no broadcast)")
+    console.print(f"Session:           {paper.session_id}", highlight=False)
+    console.print(f"Database:          {safe_url(paper.database_url)}", highlight=False)
+    console.print(
+        f"Starting bankroll: {paper.bankroll_sol:.4f} SOL  (requested {paper.requested})",
+        highlight=False,
+    )
+    console.print(
+        f"SOL/EUR at start:  €{paper.sol_eur_start:.2f} ({paper.fx_source} rate, "
+        f"{paper.fx_at:%Y-%m-%d %H:%M:%S} UTC)",
+        highlight=False,
+    )
+    console.print(f"Starting equity:   €{paper.bankroll_eur:.2f}", highlight=False)
+    if equity != paper.bankroll_eur:
+        console.print(f"Resumed equity:    €{equity:.2f}", highlight=False)
+    console.print("Stop with Ctrl+C; a session summary is printed on exit.", style="dim")
+    console.print()
+
+
+@app.command()
+def paper(
+    config: ConfigOpt = None,
+    bankroll_sol: Annotated[
+        str | None,
+        typer.Option("--bankroll-sol", help="Starting bankroll in SOL, converted once at start"),
+    ] = None,
+    bankroll_eur: Annotated[
+        str | None, typer.Option("--bankroll-eur", help="Starting bankroll in EUR")
+    ] = None,
+    name: Annotated[
+        str | None, typer.Option("--name", help="Label for this experiment (part of the id)")
+    ] = None,
+    resume: Annotated[
+        str | None,
+        typer.Option("--resume", help="Resume an existing paper session id (explicit only)"),
+    ] = None,
+    allow_fallback_fx: Annotated[
+        bool,
+        typer.Option(
+            "--allow-fallback-fx",
+            help="Start even if no live SOL/EUR rate is available (marked as fallback)",
+        ),
+    ] = False,
+    list_sessions: Annotated[
+        bool, typer.Option("--list", help="List paper sessions in this runtime home and exit")
+    ] = False,
+    no_dashboard: Annotated[
+        bool, typer.Option("--no-dashboard", help="Plain log output instead of the TUI")
+    ] = False,
+    duration: Annotated[
+        float | None, typer.Option("--duration", help="Stop after N seconds (testing)")
+    ] = None,
+    seed: Annotated[int, typer.Option("--seed", help="Synthetic world seed")] = 7,
+    quiet: Annotated[bool, typer.Option("--quiet", help="No per-event stdout")] = False,
+) -> None:
+    """Paper trade on LIVE market data with NO real funds: a fresh, isolated session with a
+    simulated bankroll (default 1 SOL). Nothing is ever signed or broadcast. Ctrl+C stops it."""
+    from solana_sniper.app.paper import (
+        BankrollRequest,
+        PaperSession,
+        PaperSetupError,
+        apply_paper_settings,
+        make_session_id,
+        paper_db_path,
+        paper_db_url,
+    )
+
+    settings = load_settings(config)
+    home = settings.home
+    assert home is not None
+    if list_sessions:
+        asyncio.run(_list_paper_sessions(home))
+        return
+    if resume is not None and (bankroll_sol is not None or bankroll_eur is not None):
         console.print(
-            f"[bold]stopped[/] equity=€{q_display(snap.equity_eur)} cash=€{q_display(snap.cash_eur)} "
-            f"realized=€{q_display(snap.realized_pnl_eur)} signals={runtime.engine.stats.signals} "
-            f"confirmed={runtime.engine.stats.confirmed} exits={runtime.engine.stats.exits} "
-            f"rejected={runtime.engine.stats.rejected}"
+            "[red]--resume continues an existing session with its recorded bankroll; "
+            "do not combine it with --bankroll-sol/--bankroll-eur[/]"
         )
-        lat = runtime.metrics.latencies
-        console.print(
-            "latency ms: "
-            + "  ".join(f"{k}={v.summary()}" for k, v in lat.items() if v.summary().get("count"))
+        raise typer.Exit(code=2)
+    if resume is not None and name is not None:
+        console.print("[red]--resume cannot be combined with --name[/]")
+        raise typer.Exit(code=2)
+    try:
+        if resume is not None:
+            if not paper_db_path(home, resume).exists():
+                raise PaperSetupError(
+                    f"no paper session {resume!r} in {home / 'db' / 'paper'} "
+                    "(solana-sniper paper --list shows the recorded ones)"
+                )
+            meta = asyncio.run(_load_paper_meta(paper_db_url(home, resume), resume))
+        else:
+            request = BankrollRequest(sol=_decimal(bankroll_sol), eur=_decimal(bankroll_eur))
+            if bankroll_sol is None and bankroll_eur is None:
+                request = BankrollRequest(sol=Decimal(1))
+                console.print("[dim]no bankroll given: defaulting to --bankroll-sol 1[/]")
+            request.validate()
+            now = datetime.now(tz=UTC)
+            session_id = make_session_id(request, name, now)
+            sol, eur, rate, source = asyncio.run(
+                _resolve_paper_bankroll(settings, request, allow_fallback_fx, now)
+            )
+            meta = PaperSession(
+                session_id=session_id,
+                name=name,
+                created_at=now,
+                requested=request.label,
+                bankroll_sol=sol,
+                bankroll_eur=eur,
+                sol_eur_start=rate,
+                fx_source=source,
+                fx_at=now,
+                config_path=str(settings.config_path) if settings.config_path else None,
+                database_url=paper_db_url(home, session_id),
+            )
+    except PaperSetupError as exc:
+        console.print(f"[red]cannot start paper session:[/] {exc}")
+        raise typer.Exit(code=2) from None
+    apply_paper_settings(settings, meta)
+    if settings.telemetry.log_file:
+        settings.telemetry.log_file = str(home / "logs" / "paper" / f"{meta.session_id}.log")
+    use_dashboard = settings.dashboard.enabled and not no_dashboard and not quiet
+    configure_logging(
+        settings.telemetry.log_level,
+        settings.telemetry.log_json,
+        settings.telemetry.log_file,
+        quiet_console=use_dashboard,
+    )
+    try:
+        asyncio.run(_run(settings, RunMode.PAPER, use_dashboard, duration, seed, quiet, meta))
+    finally:
+        logging.shutdown()
+
+
+def _decimal(raw: str | None) -> Decimal | None:
+    from solana_sniper.app.paper import PaperSetupError
+
+    if raw is None:
+        return None
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        raise PaperSetupError(f"{raw!r} is not a number") from None
+
+
+async def _resolve_paper_bankroll(
+    settings: object, request: object, allow_fallback_fx: bool, now: datetime
+) -> tuple[Decimal, Decimal, Decimal, str]:
+    from solana_sniper.app.bootstrap import build_fx
+    from solana_sniper.app.paper import BankrollRequest, resolve_bankroll
+    from solana_sniper.config.settings import Settings
+    from solana_sniper.infra.http import HttpClient
+
+    assert isinstance(settings, Settings) and isinstance(request, BankrollRequest)
+    http = HttpClient(timeout_s=settings.providers.http_timeout_s)
+    try:
+        fx = build_fx(settings, http)
+        synthetic = settings.is_synthetic or settings.quotes.source == "synthetic"
+        sol, eur, rate, source = await resolve_bankroll(
+            fx, request, allow_fallback_fx=allow_fallback_fx or synthetic, now=now
         )
+        # the synthetic world has no market: its static rate is labelled as such, never "live"
+        return sol, eur, rate, ("synthetic" if synthetic else source)
+    finally:
+        await http.aclose()
+
+
+async def _load_paper_meta(database_url: str, session_id: str) -> PaperSession:
+    from solana_sniper.app.paper import PaperSetupError
+
+    repo = Repository(database_url, session_id=session_id)
+    await repo.init()
+    try:
+        meta = await repo.paper_session(session_id)
+    finally:
+        await repo.close()
+    if meta is None:
+        raise PaperSetupError(f"{session_id} has a database but no paper metadata; not resumable")
+    return meta
+
+
+async def _list_paper_sessions(home: Path) -> None:
+    from solana_sniper.app.paper import PAPER_DIR
+
+    folder = home / "db" / PAPER_DIR
+    files = sorted(folder.glob("paper-*.db")) if folder.exists() else []
+    if not files:
+        console.print(f"no paper sessions in {folder}")
+        return
+    table = Table(title=f"paper sessions in {folder}")
+    for col in ("session", "requested", "SOL/EUR start", "fx", "equity now", "ended"):
+        table.add_column(col)
+    for f in files:
+        sid = f.stem
+        repo = Repository(f"sqlite+aiosqlite:///{f}", session_id="cli")
+        try:
+            await repo.init()
+            meta = await repo.paper_session(sid)
+            snap = await repo.latest_portfolio_snapshot()
+            sessions = await repo.list_sessions(limit=1)
+        finally:
+            await repo.close()
+        ended = sessions[0]["ended_at"] if sessions else None
+        table.add_row(
+            sid,
+            meta.requested if meta else "?",
+            f"€{meta.sol_eur_start:.2f}" if meta else "?",
+            meta.fx_source if meta else "?",
+            f"€{q_display(snap.equity_eur)}" if snap else "-",
+            "running/unknown" if ended is None else str(ended)[:19],
+        )
+    console.print(table)
+    console.print("[dim]resume one with: solana-sniper paper --resume <session>[/]")
+
+
+@app.command("smoke-test")
+def smoke_test(
+    config: ConfigOpt = None,
+    timeout_s: Annotated[float, typer.Option("--timeout", help="Per-check timeout")] = 10.0,
+) -> None:
+    """Real-network check of every provider (no trading): latency, rate limiting, advice."""
+    from solana_sniper.app.smoke import run_smoke
+
+    settings = load_settings(config)
+    console.print(_context_line(settings))
+    if settings.is_synthetic:
+        console.print("[yellow]synthetic config: nothing to smoke-test on the network[/]")
+        raise typer.Exit(code=0)
+    results = asyncio.run(run_smoke(settings, timeout_s=timeout_s))
+    table = Table(title="smoke test (real network, no trading)")
+    for col in ("check", "status", "latency", "provider", "detail", "recommendation"):
+        table.add_column(col, overflow="fold")
+    colors = {"PASS": "green", "FAIL": "red", "WARN": "yellow", "SKIP": "dim"}
+    for r in results:
+        table.add_row(
+            r.name,
+            f"[{colors[r.status]}]{r.status}[/]",
+            f"{r.latency_ms:.0f} ms" if r.latency_ms is not None else "-",
+            r.provider_state or "-",
+            r.detail,
+            r.recommendation,
+        )
+    console.print(table)
+    failed = [r.name for r in results if r.status == "FAIL"]
+    if failed:
+        console.print(f"[red]failed:[/] {', '.join(failed)}")
+        raise typer.Exit(code=1)
+    console.print("[green]all required checks passed[/]")
+
+
+service_app = typer.Typer(
+    help="Background macOS service (launchd). Thin wrappers around ./start.sh, ./stop.sh, ..."
+)
+app.add_typer(service_app, name="service")
+
+
+def _script(name: str, *args: str) -> None:
+    from solana_sniper.app.repo_safety import repo_root_from_package
+
+    root = repo_root_from_package() or Path(__file__).resolve().parents[3]
+    script = root / name
+    if not script.exists():
+        console.print(f"[red]{script} not found; run from a git checkout[/]")
+        raise typer.Exit(code=1)
+    code = subprocess.call([str(script), *args])
+    raise typer.Exit(code=code)
+
+
+@service_app.command("start")
+def service_start() -> None:
+    """Start (or re-register) the launchd service."""
+    _script("start.sh")
+
+
+@service_app.command("stop")
+def service_stop() -> None:
+    """Stop the launchd service gracefully."""
+    _script("stop.sh")
+
+
+@service_app.command("restart")
+def service_restart() -> None:
+    """Restart the launchd service."""
+    _script("restart.sh")
+
+
+@service_app.command("status")
+def service_status() -> None:
+    """launchd state plus the engine heartbeat."""
+    _script("status.sh")
+
+
+@service_app.command("logs")
+def service_logs(
+    follow: Annotated[bool, typer.Option("--follow", "-f", help="Keep following")] = False,
+    lines: Annotated[int, typer.Option("-n", help="Lines to show")] = 50,
+) -> None:
+    """Show recent service logs (add --follow to keep watching)."""
+    args = ["-n", str(lines)] + (["--follow"] if follow else [])
+    _script("logs.sh", *args)
+
+
+@service_app.command("install")
+def service_install() -> None:
+    """Run the macOS installer (venv, deps, tests, launchd agent)."""
+    _script("install-macos.sh")
 
 
 async def _plain_status(runtime: object) -> None:
@@ -192,16 +589,46 @@ def _open_repo(config: Path | None) -> tuple[Repository, object]:
 
 
 @app.command()
-def status(config: ConfigOpt = None) -> None:
+def status(
+    config: ConfigOpt = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Machine-readable output (no wrapping)")
+    ] = False,
+) -> None:
     """Portfolio + activity summary from the database (works while `run` is active)."""
 
     async def go() -> None:
-        repo, _ = _open_repo(config)
+        repo, settings = _open_repo(config)
         await repo.init()
         snap = await repo.latest_portfolio_snapshot()
         counts = await repo.counts()
         sessions = await repo.list_sessions(limit=3)
         await repo.close()
+        from solana_sniper.config.settings import Settings
+
+        assert isinstance(settings, Settings)
+        if json_output:
+            payload = {
+                "home": str(settings.home),
+                "database_url": settings.storage.database_url,
+                "config": str(settings.config_path) if settings.config_path else None,
+                "counts": counts,
+                "sessions": sessions,
+                "portfolio": None
+                if snap is None
+                else {
+                    "at": snap.at.isoformat(),
+                    "equity_eur": str(snap.equity_eur),
+                    "cash_eur": str(snap.cash_eur),
+                    "realized_pnl_eur": str(snap.realized_pnl_eur),
+                    "open_positions": snap.open_positions,
+                    "wins": snap.wins,
+                    "losses": snap.losses,
+                },
+            }
+            print(json.dumps(payload, default=str))
+            return
+        console.print(_context_line(settings))
         if snap is None:
             console.print("no portfolio snapshot yet")
         else:
@@ -420,7 +847,20 @@ def evaluate(
         repo, _ = _open_repo(config)
         await repo.init()
         rows = await repo.outcomes(session_id=session)
+        incomplete: list[dict[str, object]] = []
+        for sid in await repo.outcome_sessions(session_id=session):
+            integrity = await repo.session_integrity(sid)
+            if integrity is not None and not integrity["complete"]:
+                incomplete.append(integrity)
         await repo.close()
+        for integrity in incomplete:
+            console.print(
+                f"[bold red]INCOMPLETE DATA[/] session {integrity['session_id']}: the storage "
+                f"writer dropped {integrity['dropped_total']} rows "
+                f"({integrity['dropped_by_kind']}) and failed {integrity['failed_total']}. "
+                "Outcome rows themselves are never dropped, but the observations behind them "
+                "have holes; treat every rate below as a lower-quality estimate."
+            )
         report = summarize(
             rows, include_truncated=include_truncated, min_observations=min_observations
         )
@@ -525,14 +965,15 @@ def _print_health(status: dict[str, object], fresh: bool, healthy: bool) -> None
         return f"{v:.0f}s ago" if isinstance(v, int | float) else "never"
 
     written = status.get("written_at", "?")
-    if healthy:
-        state, color = "HEALTHY", "green"
-    elif status.get("stopped"):
+    if status.get("stopped"):
         state, color = "STOPPED", "yellow"
     elif not fresh:
         state, color = "STALE", "red"
+    elif healthy:
+        state, color = "HEALTHY", "green"
     else:
-        state, color = "DEGRADED", "yellow"
+        state = str(status.get("state") or "DEGRADED")
+        color = "red" if state == "UNHEALTHY" else "yellow"
     table = Table(title=f"heartbeat [{color}]{state}[/] @ {written}")
     table.add_column("item")
     table.add_column("value")
@@ -542,6 +983,21 @@ def _print_health(status: dict[str, object], fresh: bool, healthy: bool) -> None
     )
     table.add_row("session", str(status.get("session_id")))
     table.add_row("uptime", f"{uptime / 60:.1f} min" if isinstance(uptime, int | float) else "?")
+    for label, key in (("problems", "problems"), ("degraded", "degraded")):
+        items = status.get(key) or []
+        if isinstance(items, list) and items:
+            table.add_row(label, "[red]" + "; ".join(str(i) for i in items) + "[/]")
+    providers = status.get("providers") or {}
+    if isinstance(providers, dict) and providers:
+        table.add_row(
+            "providers",
+            "  ".join(
+                f"{name}={info.get('state', '?')}"
+                + (f"(cooldown {info['cooldown_s']:.0f}s)" if info.get("cooldown_s") else "")
+                for name, info in providers.items()
+                if isinstance(info, dict)
+            ),
+        )
     engine = status.get("engine") or {}
     assert isinstance(engine, dict)
     table.add_row(
@@ -572,6 +1028,15 @@ def _print_health(status: dict[str, object], fresh: bool, healthy: bool) -> None
         f"failures {db.get('failures')}  dropped {db.get('dropped')}  queued {db.get('queued')}"
         + (f"  [red]{db.get('last_error')}[/]" if db.get("last_error") else ""),
     )
+    integrity = db.get("integrity") or {}
+    if isinstance(integrity, dict) and not integrity.get("complete", True):
+        by_kind = integrity.get("dropped_by_kind") or {}
+        table.add_row(
+            "data integrity",
+            "[red]INCOMPLETE[/] dropped "
+            + ", ".join(f"{k}={v}" for k, v in dict(by_kind).items())
+            + " (research data has holes; trades/positions/ledger are never dropped)",
+        )
     table.add_row(
         "tokens monitored",
         f"{status.get('tokens_monitored')} (qualified {status.get('qualified')}, pending signals {status.get('pending_signals')})",
@@ -620,7 +1085,12 @@ def migrate(config: ConfigOpt = None) -> None:
 
 
 @app.command("config-check")
-def config_check(config: ConfigOpt = None) -> None:
+def config_check(
+    config: ConfigOpt = None,
+    json_output: Annotated[
+        bool, typer.Option("--json", help="Machine-readable output (no wrapping)")
+    ] = False,
+) -> None:
     """Load and validate configuration without touching the network; exit 1 on problems."""
     try:
         settings = load_settings(config)
@@ -638,8 +1108,26 @@ def config_check(config: ConfigOpt = None) -> None:
         problems.append(
             "quotes.prepare_unsigned_transaction needs providers.wallet_public_key (PUBLIC key)"
         )
+    if json_output:
+        print(
+            json.dumps(
+                {
+                    "ok": not problems,
+                    "problems": problems,
+                    "config": str(settings.config_path) if settings.config_path else None,
+                    "home": str(settings.home),
+                    "profile": str(settings.risk.profile),
+                    "bankroll_eur": str(settings.risk.starting_bankroll_eur),
+                    "sources": list(settings.discovery.sources),
+                    "quotes": settings.quotes.source,
+                    "database_url": settings.storage.database_url,
+                    "log_file": settings.telemetry.log_file,
+                }
+            )
+        )
+        raise typer.Exit(code=0 if not problems else 1)
     console.print(
-        f"config {settings.config_path or 'defaults'}  home {settings.home or '(cwd)'}  "
+        f"config {settings.config_path or 'defaults'}  home {settings.home}  "
         f"profile {settings.risk.profile}  bankroll €{settings.risk.starting_bankroll_eur}  "
         f"sources {settings.discovery.sources}  quotes {settings.quotes.source}  "
         f"db {safe_url(settings.storage.database_url)}  log {settings.telemetry.log_file}"
@@ -657,6 +1145,7 @@ def doctor(config: ConfigOpt = None) -> None:
     from solana_sniper.app.doctor import run_doctor
 
     settings = load_settings(config)
+    console.print(_context_line(settings))
     results = asyncio.run(run_doctor(settings))
     table = Table(title="doctor")
     table.add_column("check")

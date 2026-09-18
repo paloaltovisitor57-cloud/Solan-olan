@@ -8,6 +8,7 @@ from decimal import Decimal
 
 import websockets
 
+from solana_sniper.app.repo_safety import check_repo_safety
 from solana_sniper.config.settings import Settings
 from solana_sniper.domain.clock import SystemClock
 from solana_sniper.infra.http import HttpClient, HttpError
@@ -37,6 +38,16 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
             "PASS",
             f"{settings.config_path or 'defaults'} profile={settings.risk.profile} "
             f"bankroll=€{settings.risk.starting_bankroll_eur} sources={settings.discovery.sources}",
+        )
+    )
+    safety = check_repo_safety()
+    out.append(CheckOutcome("repo_safety", safety.status, safety.detail))
+    out.append(
+        CheckOutcome(
+            "runtime_home",
+            "PASS",
+            f"{settings.home}  db={safe_url(settings.storage.database_url)}  "
+            f"log={settings.telemetry.log_file}",
         )
     )
     # database

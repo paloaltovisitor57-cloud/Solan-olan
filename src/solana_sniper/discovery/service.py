@@ -10,9 +10,11 @@ from solana_sniper.config.settings import DiscoveryConfig
 from solana_sniper.discovery.base import PollingDiscoveryProvider, TokenDiscoveryProvider
 from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.models import TokenInfo
+from solana_sniper.infra.http import ProviderUnavailableError, RateLimitedError
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
 from solana_sniper.telemetry.redaction import safe_exception
+from solana_sniper.telemetry.throttle import LogThrottle
 
 log = get_logger(__name__)
 
@@ -32,6 +34,7 @@ class DiscoveryService:
         self._streaming: list[TokenDiscoveryProvider] = []
         self._polling: list[PollingDiscoveryProvider] = []
         self._seen: dict[str, datetime] = {}
+        self._throttle = LogThrottle(60.0)
         self.accepted = 0
         self.skipped_old = 0
         self.duplicates = 0
@@ -93,11 +96,22 @@ class DiscoveryService:
                     await self.handle(token)
             except asyncio.CancelledError:
                 raise
+            except (RateLimitedError, ProviderUnavailableError) as exc:
+                # the governor already summarised the rate limit; wait out its cooldown
+                wait = min(300.0, max(interval, exc.retry_after_s or interval))
+                log.debug("discovery_poll_throttled", provider=provider.name, wait_s=wait)
+                await asyncio.sleep(wait)
+                continue
             except Exception as exc:
                 self._metrics.inc("provider_errors")
-                log.warning(
-                    "discovery_poll_error", provider=provider.name, error=safe_exception(exc)
-                )
+                decision = self._throttle.hit(provider.name)
+                if decision.log:
+                    log.warning(
+                        "discovery_poll_error",
+                        provider=provider.name,
+                        error=safe_exception(exc),
+                        suppressed_since_last=decision.suppressed,
+                    )
             await asyncio.sleep(interval)
 
     async def run(self) -> None:

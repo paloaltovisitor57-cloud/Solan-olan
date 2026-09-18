@@ -15,8 +15,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import delete, select, update
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy import delete, func, select, update
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -24,6 +24,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from solana_sniper.app.paper import PaperSession
 from solana_sniper.domain.enums import FillProvenance, Venue
 from solana_sniper.domain.models import (
     BuySignal,
@@ -57,10 +58,12 @@ from solana_sniper.storage.models import (
     MilestoneRow,
     ObservationRow,
     OutcomeRow,
+    PaperSessionRow,
     PortfolioSnapshotRow,
     PositionRow,
     QuoteRow,
     ScoreRow,
+    SessionIntegrityRow,
     SessionRow,
     SignalRow,
     StateTransitionRow,
@@ -76,6 +79,36 @@ from solana_sniper.telemetry.redaction import safe_exception
 log = get_logger(__name__)
 
 WriteOp = Callable[[AsyncSession], Awaitable[None]]
+
+# Record classes. CRITICAL rows are committed synchronously at their boundary (never queued);
+# IMPORTANT rows go through the background writer but are never dropped; TELEMETRY rows are
+# research data that may be dropped only when the writer falls hopelessly behind, and every drop
+# is counted per kind, logged, and degrades health.
+CRITICAL_KINDS = frozenset({"fill", "position", "ledger", "account_state", "outcome", "session"})
+IMPORTANT_KINDS = frozenset(
+    {"token", "token_state", "signal", "decision", "execution_record", "milestone"}
+)
+TELEMETRY_KINDS = frozenset(
+    {
+        "observation",
+        "trade",
+        "feature",
+        "check",
+        "score",
+        "quote",
+        "portfolio_snapshot",
+        "error",
+        "transition",
+    }
+)
+
+
+class _Op:
+    __slots__ = ("kind", "op")
+
+    def __init__(self, kind: str, op: WriteOp) -> None:
+        self.kind = kind
+        self.op = op
 
 
 class RecoveredState:
@@ -118,27 +151,42 @@ class Repository:
         batch_size: int = 200,
         flush_interval_s: float = 0.5,
         metrics: Metrics | None = None,
+        max_queued_telemetry: int = 20_000,
+        busy_timeout_s: float = 30.0,
     ) -> None:
         if database_url.startswith("sqlite+aiosqlite:///") and ":memory:" not in database_url:
             path = database_url.removeprefix("sqlite+aiosqlite:///")
             Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self._engine: AsyncEngine = create_async_engine(database_url, future=True)
+        connect_args: dict[str, Any] = {}
+        if database_url.startswith("sqlite"):
+            # Readers (the CLI while the engine runs) and the single writer share the file:
+            # wait for the lock instead of failing with "database is locked".
+            connect_args["timeout"] = busy_timeout_s
+        self._engine: AsyncEngine = create_async_engine(
+            database_url, future=True, connect_args=connect_args
+        )
         self._sessions = async_sessionmaker(self._engine, expire_on_commit=False)
         self.session_id = session_id
-        self._queue: asyncio.Queue[WriteOp] = asyncio.Queue(maxsize=20_000)
+        self.database_url = database_url
+        self._queue: asyncio.Queue[_Op] = asyncio.Queue()
+        self._telemetry_queued = 0
+        self._max_telemetry = max_queued_telemetry
         self._batch = batch_size
         self._interval = flush_interval_s
         self._metrics = metrics
         self._task: asyncio.Task[None] | None = None
         self._inflight: asyncio.Task[None] | None = None
-        self._pending: list[WriteOp] = []  # dequeued by the writer, not yet handed to a commit
+        self._pending: list[_Op] = []  # dequeued by the writer, not yet handed to a commit
+        self._write_lock = asyncio.Lock()  # one writer at a time: SQLite is single-writer
         self._stopping = False
         self.dropped = 0
         self.failures = 0
+        self.dropped_by_kind: dict[str, int] = {}
+        self.failed_by_kind: dict[str, int] = {}
         self.last_flush_at: datetime | None = None
         self.last_flush_error: str | None = None
+        self._drop_log_at: dict[str, float] = {}
 
-    # ------------------------------------------------------------ lifecycle
     async def init(self) -> None:
         async with self._engine.begin() as conn:
             if self._engine.dialect.name == "sqlite":
@@ -174,14 +222,20 @@ class Repository:
         writer may currently be holding."""
         ops = self._take_pending()
         while not self._queue.empty():
-            ops.append(self._queue.get_nowait())
+            ops.append(self._dequeue())
         await self._await_inflight()
         if ops:
             await self._run_batch(ops)
 
-    def _take_pending(self) -> list[WriteOp]:
+    def _take_pending(self) -> list[_Op]:
         ops, self._pending = self._pending, []
         return ops
+
+    def _dequeue(self) -> _Op:
+        item = self._queue.get_nowait()
+        if item.kind in TELEMETRY_KINDS:
+            self._telemetry_queued -= 1
+        return item
 
     async def _writer(self) -> None:
         while True:
@@ -189,13 +243,15 @@ class Repository:
                 first = await asyncio.wait_for(self._queue.get(), timeout=self._interval)
             except TimeoutError:
                 continue
+            if first.kind in TELEMETRY_KINDS:
+                self._telemetry_queued -= 1
             self._pending.append(first)
             cancelled = False
             deadline = time.monotonic() + self._interval
             try:
                 while len(self._pending) < self._batch and time.monotonic() < deadline:
                     try:
-                        self._pending.append(self._queue.get_nowait())
+                        self._pending.append(self._dequeue())
                     except asyncio.QueueEmpty:
                         await asyncio.sleep(0.01)
             except asyncio.CancelledError:
@@ -213,64 +269,133 @@ class Repository:
             if cancelled:
                 raise asyncio.CancelledError
 
-    async def _run_batch(self, ops: Sequence[WriteOp]) -> None:
+    async def _run_batch(self, ops: Sequence[_Op]) -> None:
+        """Commit a batch. Batches are serialised by a lock so two sessions never interleave on
+        the same rows (SQLite is single-writer anyway; interleaving only produced lock waits and
+        select-then-insert races). A failed batch is retried once, then op by op so one bad row
+        cannot poison the others; every op that still fails is counted per record kind."""
         started = time.perf_counter()
-        for attempt in range(2):
-            try:
-                async with self._sessions() as session:
-                    for op in ops:
-                        await op(session)
-                    await session.commit()
-                if self._metrics:
-                    self._metrics.observe("storage_flush", (time.perf_counter() - started) * 1000)
-                self.last_flush_at = datetime.now(tz=UTC)
-                self.last_flush_error = None
-                return
-            except SQLAlchemyError as exc:
-                self.failures += 1
-                self.last_flush_error = safe_exception(exc)[:200]
-                log.error(
-                    "storage_batch_failed", attempt=attempt, ops=len(ops), error=safe_exception(exc)
-                )
-                await asyncio.sleep(0.2)
-        # second failure: try ops individually so one bad row does not poison the batch
-        for op in ops:
-            try:
-                async with self._sessions() as session:
-                    await op(session)
-                    await session.commit()
-            except SQLAlchemyError as exc:
-                self.dropped += 1
-                log.error("storage_op_dropped", error=safe_exception(exc))
+        async with self._write_lock:
+            for attempt in range(2):
+                try:
+                    async with self._sessions() as session:
+                        for item in ops:
+                            await item.op(session)
+                        await session.commit()
+                    if self._metrics:
+                        self._metrics.observe(
+                            "storage_flush", (time.perf_counter() - started) * 1000
+                        )
+                    self.last_flush_at = datetime.now(tz=UTC)
+                    self.last_flush_error = None
+                    return
+                except Exception as exc:  # SQLAlchemy errors and row-builder failures alike
+                    self.failures += 1
+                    self.last_flush_error = safe_exception(exc)[:200]
+                    log.error(
+                        "storage_batch_failed",
+                        attempt=attempt,
+                        ops=len(ops),
+                        kinds=sorted({i.kind for i in ops}),
+                        error=safe_exception(exc),
+                    )
+                    await asyncio.sleep(0.2)
+            # second failure: try ops individually so one bad row does not poison the batch
+            for item in ops:
+                try:
+                    async with self._sessions() as session:
+                        await item.op(session)
+                        await session.commit()
+                except Exception as exc:
+                    self._count_drop(item.kind, failed=True)
+                    log.error("storage_op_dropped", kind=item.kind, error=safe_exception(exc))
+
+    # ------------------------------------------------------------ integrity
+    def _count_drop(self, kind: str, *, failed: bool) -> None:
+        self.dropped += 1
+        self.dropped_by_kind[kind] = self.dropped_by_kind.get(kind, 0) + 1
+        if failed:
+            self.failed_by_kind[kind] = self.failed_by_kind.get(kind, 0) + 1
+        if self._metrics:
+            self._metrics.inc("storage_dropped")
+        # one line per kind per minute, with the running total, instead of one per row
+        now = time.monotonic()
+        if now - self._drop_log_at.get(kind, -1e9) >= 60.0:
+            self._drop_log_at[kind] = now
+            log.warning(
+                "storage_degraded",
+                kind=kind,
+                dropped_kind=self.dropped_by_kind[kind],
+                dropped_total=self.dropped,
+                reason="write failed" if failed else "telemetry queue over budget",
+            )
+
+    def note_dropped(self, kind: str, reason: str) -> None:
+        """A write that could not even be built (serialization failure upstream)."""
+        self._count_drop(kind, failed=True)
+        self.last_flush_error = reason
+
+    @property
+    def degraded(self) -> bool:
+        """True once any write was dropped or failed: the recorded data is incomplete."""
+        return self.dropped > 0 or self.failures > 0
+
+    def integrity_summary(self) -> dict[str, Any]:
+        return {
+            "complete": not self.degraded,
+            "dropped_total": self.dropped,
+            "failed_total": self.failures,
+            "dropped_by_kind": dict(sorted(self.dropped_by_kind.items())),
+            "failed_by_kind": dict(sorted(self.failed_by_kind.items())),
+            "queued": self._queue.qsize(),
+            "telemetry_queued": self._telemetry_queued,
+            "telemetry_budget": self._max_telemetry,
+            "last_flush_error": self.last_flush_error,
+        }
 
     @property
     def queue_size(self) -> int:
         return self._queue.qsize()
 
-    def persist(self, op: WriteOp) -> None:
-        try:
-            self._queue.put_nowait(op)
-        except asyncio.QueueFull:
-            self.dropped += 1
+    def persist(self, op: WriteOp, kind: str = "telemetry") -> None:
+        """Queue a background write. TELEMETRY kinds are dropped (and counted) when the writer is
+        more than `max_queued_telemetry` rows behind; every other kind is always queued."""
+        if kind not in IMPORTANT_KINDS and kind not in CRITICAL_KINDS:
+            if self._telemetry_queued >= self._max_telemetry:
+                self._count_drop(kind, failed=False)
+                return
+            self._telemetry_queued += 1
+        self._queue.put_nowait(_Op(kind, op))
 
-    async def persist_now(self, op: WriteOp) -> None:
-        await self._run_batch([op])
+    async def persist_now(self, op: WriteOp, kind: str = "critical") -> None:
+        await self._run_batch([_Op(kind, op)])
 
     # ------------------------------------------------------------ write ops
     async def start_session(self, mode: str, config_path: str | None) -> None:
-        async def op(s: AsyncSession) -> None:
-            s.add(
-                SessionRow(
-                    session_id=self.session_id,
-                    started_at=datetime.now(tz=UTC),
-                    mode=mode,
-                    config_path=config_path,
-                )
-            )
+        """Create the session row, or re-open it when an existing session is resumed."""
+        started = datetime.now(tz=UTC)
 
-        await self.persist_now(op)
+        async def op(s: AsyncSession) -> None:
+            stmt = sqlite_insert(SessionRow).values(
+                session_id=self.session_id,
+                started_at=started,
+                ended_at=None,
+                mode=mode,
+                config_path=config_path,
+                notes="",
+            )
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[SessionRow.session_id],
+                set_={"ended_at": None, "mode": mode, "config_path": config_path},
+            )
+            await s.execute(stmt)
+
+        await self.persist_now(op, "session")
 
     async def end_session(self) -> None:
+        await self.flush()
+        await self.record_integrity()
+
         async def op(s: AsyncSession) -> None:
             await s.execute(
                 update(SessionRow)
@@ -278,34 +403,131 @@ class Repository:
                 .values(ended_at=datetime.now(tz=UTC))
             )
 
-        await self.persist_now(op)
+        await self.persist_now(op, "session")
 
-    def save_token(self, token: TokenInfo) -> None:
+    async def save_paper_session(self, meta: PaperSession) -> None:
         async def op(s: AsyncSession) -> None:
-            await s.merge(
-                TokenRow(
-                    mint=token.mint,
-                    session_id=self.session_id,
-                    symbol=token.symbol,
-                    name=token.name,
-                    decimals=token.decimals,
-                    created_at=token.created_at,
-                    pool_created_at=token.pool_created_at,
-                    venue=str(token.venue),
-                    pool_address=token.pool_address,
-                    quote_mint=token.quote_mint,
-                    source=token.source,
-                    discovered_at=token.discovered_at,
+            row = await s.get(PaperSessionRow, meta.session_id)
+            if row is not None:
+                return  # metadata is immutable once recorded: the original bankroll stays
+            s.add(
+                PaperSessionRow(
+                    session_id=meta.session_id,
+                    name=meta.name,
+                    created_at=meta.created_at,
+                    requested=meta.requested,
+                    bankroll_sol=str(meta.bankroll_sol),
+                    bankroll_eur=str(meta.bankroll_eur),
+                    sol_eur_start=str(meta.sol_eur_start),
+                    fx_source=meta.fx_source,
+                    fx_at=meta.fx_at,
+                    config_path=meta.config_path,
+                    database_url=meta.database_url,
+                    payload=meta.to_payload(),
                 )
             )
 
-        self.persist(op)
+        await self.persist_now(op, "session")
+
+    async def paper_session(self, session_id: str) -> PaperSession | None:
+        async with self._sessions() as s:
+            row = await s.get(PaperSessionRow, session_id)
+        return PaperSession.from_payload(row.payload) if row is not None else None
+
+    async def record_integrity(self) -> None:
+        """Persist this session's write-integrity counters so later readers (evaluate, status)
+        can tell complete data from data with holes."""
+        summary = self.integrity_summary()
+        now = datetime.now(tz=UTC)
+
+        async def op(s: AsyncSession) -> None:
+            row = await s.get(SessionIntegrityRow, self.session_id)
+            if row is None:
+                row = SessionIntegrityRow(session_id=self.session_id, updated_at=now)
+                s.add(row)
+            row.updated_at = now
+            row.dropped_total = int(summary["dropped_total"])
+            row.failed_total = int(summary["failed_total"])
+            row.dropped_by_kind = dict(summary["dropped_by_kind"])
+            row.failed_by_kind = dict(summary["failed_by_kind"])
+            row.complete = bool(summary["complete"])
+            row.last_error = summary["last_flush_error"]
+
+        await self.persist_now(op, "session")
+
+    async def session_integrity(self, session_id: str) -> dict[str, Any] | None:
+        async with self._sessions() as s:
+            row = await s.get(SessionIntegrityRow, session_id)
+        if row is None:
+            return None
+        return {
+            "session_id": row.session_id,
+            "updated_at": _aware(row.updated_at).isoformat(),
+            "complete": bool(row.complete),
+            "dropped_total": row.dropped_total,
+            "failed_total": row.failed_total,
+            "dropped_by_kind": dict(row.dropped_by_kind or {}),
+            "failed_by_kind": dict(row.failed_by_kind or {}),
+            "last_error": row.last_error,
+        }
+
+    def _token_op(self, token: TokenInfo) -> WriteOp:
+        """Idempotent token upsert (INSERT ... ON CONFLICT(mint) DO UPDATE).
+
+        Deterministic merge semantics: the first sighting keeps its provenance (session_id,
+        source, discovered_at); later sightings fill metadata that was missing (symbol, name,
+        decimals, creation times, pool, quote mint) and refresh what they know; final_state is
+        never touched by a rediscovery. A duplicate mint from any number of providers, in the
+        same batch or across concurrent batches, is therefore normal, not an error."""
+        values: dict[str, Any] = {
+            "mint": token.mint,
+            "session_id": self.session_id,
+            "symbol": token.symbol,
+            "name": token.name,
+            "decimals": token.decimals,
+            "created_at": token.created_at,
+            "pool_created_at": token.pool_created_at,
+            "venue": str(token.venue),
+            "pool_address": token.pool_address,
+            "quote_mint": token.quote_mint,
+            "source": token.source,
+            "discovered_at": token.discovered_at,
+        }
+
+        async def op(s: AsyncSession) -> None:
+            stmt = sqlite_insert(TokenRow).values(**values)
+            excluded = stmt.excluded
+            stmt = stmt.on_conflict_do_update(
+                index_elements=[TokenRow.mint],
+                set_={
+                    "symbol": func.coalesce(excluded.symbol, TokenRow.symbol),
+                    "name": func.coalesce(excluded.name, TokenRow.name),
+                    "decimals": func.coalesce(excluded.decimals, TokenRow.decimals),
+                    "created_at": func.coalesce(excluded.created_at, TokenRow.created_at),
+                    "pool_created_at": func.coalesce(
+                        excluded.pool_created_at, TokenRow.pool_created_at
+                    ),
+                    "pool_address": func.coalesce(excluded.pool_address, TokenRow.pool_address),
+                    "quote_mint": func.coalesce(excluded.quote_mint, TokenRow.quote_mint),
+                    "venue": func.coalesce(excluded.venue, TokenRow.venue),
+                    "discovered_at": func.coalesce(TokenRow.discovered_at, excluded.discovered_at),
+                },
+            )
+            await s.execute(stmt)
+
+        return op
+
+    def save_token(self, token: TokenInfo) -> None:
+        self.persist(self._token_op(token), "token")
+
+    async def save_token_now(self, token: TokenInfo) -> None:
+        await self.persist_now(self._token_op(token), "token")
 
     def save_token_state(self, mint: str, state: str) -> None:
         async def op(s: AsyncSession) -> None:
             await s.execute(update(TokenRow).where(TokenRow.mint == mint).values(final_state=state))
 
-        self.persist(op)
+        self.persist(op, "token_state")
 
     def save_observation(self, snap: MarketSnapshot) -> None:
         payload = to_jsonable(snap)
@@ -321,7 +543,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "observation")
 
     def save_trade(self, trade: TradeEvent) -> None:
         payload = to_jsonable(trade)
@@ -336,7 +558,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "trade")
 
     def save_features(self, f: FeatureVector) -> None:
         payload = f.as_dict()
@@ -351,7 +573,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "feature")
 
     def save_checks(self, report: CheckReport) -> None:
         payload = to_jsonable(report)
@@ -370,7 +592,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "check")
 
     def save_score(self, score: EntryScore) -> None:
         payload = to_jsonable(score)
@@ -386,7 +608,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "score")
 
     def save_signal(self, signal: BuySignal | SellSignal, status: str) -> None:
         payload = to_jsonable(signal)
@@ -405,7 +627,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "signal")
 
     def update_signal_status(self, signal_id: str, status: str) -> None:
         async def op(s: AsyncSession) -> None:
@@ -429,7 +651,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "decision")
 
     def save_quote(self, q: SwapQuote, mint: str) -> None:
         payload = to_jsonable(q)
@@ -449,7 +671,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "quote")
 
     def _position_op(self, p: Position) -> WriteOp:
         payload = to_jsonable(p)
@@ -470,7 +692,7 @@ class Repository:
         return op
 
     def save_position(self, p: Position) -> None:
-        self.persist(self._position_op(p))
+        self.persist(self._position_op(p), "position")
 
     async def save_position_now(self, p: Position) -> None:
         await self.persist_now(self._position_op(p))
@@ -559,7 +781,7 @@ class Repository:
         async def op(s: AsyncSession) -> None:
             s.add(PortfolioSnapshotRow(session_id=self.session_id, at=snap.at, payload=payload))
 
-        self.persist(op)
+        self.persist(op, "portfolio_snapshot")
 
     def save_milestone(self, m: MilestoneEvent) -> None:
         async def op(s: AsyncSession) -> None:
@@ -573,7 +795,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "milestone")
 
     def save_execution_record(self, r: ExecutionRecord) -> None:
         async def op(s: AsyncSession) -> None:
@@ -594,7 +816,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "execution_record")
 
     def save_transition(
         self, mint: str, source: str, target: str, at: datetime, reason: str
@@ -611,7 +833,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "transition")
 
     def _outcome_op(self, o: Outcome) -> WriteOp:
         async def op(s: AsyncSession) -> None:
@@ -648,15 +870,22 @@ class Repository:
 
     def save_outcome(self, o: Outcome) -> None:
         """Queue one forward-outcome row (background writer; may be dropped under backlog)."""
-        self.persist(self._outcome_op(o))
+        self.persist(self._outcome_op(o), "outcome")
 
     async def save_outcomes_now(self, outcomes: Sequence[Outcome]) -> None:
         """Commit forward-outcome rows immediately, bypassing the bounded background queue.
         These rows are the measurement record, so they must not be dropped when the queue is
         full of telemetry."""
-        ops = [self._outcome_op(o) for o in outcomes]
+        ops = [_Op("outcome", self._outcome_op(o)) for o in outcomes]
         if ops:
             await self._run_batch(ops)
+
+    async def outcome_sessions(self, *, session_id: str | None = None) -> list[str]:
+        async with self._sessions() as s:
+            stmt = select(OutcomeRow.session_id).distinct()
+            if session_id is not None:
+                stmt = stmt.where(OutcomeRow.session_id == session_id)
+            return [str(r) for r in (await s.execute(stmt)).scalars().all()]
 
     async def outcomes(
         self, *, limit: int = 100_000, session_id: str | None = None
@@ -684,7 +913,7 @@ class Repository:
                 )
             )
 
-        self.persist(op)
+        self.persist(op, "error")
 
     # ------------------------------------------------------------- recovery
     async def load_state(self) -> RecoveredState:

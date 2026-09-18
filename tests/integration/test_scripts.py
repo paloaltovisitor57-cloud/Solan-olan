@@ -31,6 +31,7 @@ case "$cmd" in
   bootstrap)
     domain="$1"; plist="$2"
     label="$(python3 -c "import plistlib,sys; print(plistlib.load(open(sys.argv[1],'rb'))['Label'])" "$plist")"
+    cp "$plist" "$STATE/$label.plist"
     python3 - "$plist" "$STATE/$label.pid" <<'PY'
 import os, plistlib, subprocess, sys
 p = plistlib.load(open(sys.argv[1], "rb"))
@@ -59,7 +60,29 @@ PY
       exit 113
     fi
     ;;
-  enable|kickstart) ;;
+  enable) ;;
+  kickstart)
+    force=0; [[ "${1:-}" == "-k" ]] && { force=1; shift; }
+    target="$1"; label="${target##*/}"
+    running=0
+    if [[ -f "$STATE/$label.pid" ]] && kill -0 "$(cat "$STATE/$label.pid")" 2>/dev/null; then running=1; fi
+    if [[ "$running" -eq 1 && "$force" -eq 0 ]]; then exit 0; fi
+    if [[ "$running" -eq 1 ]]; then
+      pid="$(cat "$STATE/$label.pid")"; kill -TERM "$pid" 2>/dev/null || true
+      for _ in $(seq 1 100); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    fi
+    plist="$STATE/$label.plist"
+    [[ -f "$plist" ]] || { echo "fake launchctl: no plist recorded for $label" >&2; exit 1; }
+    python3 - "$plist" "$STATE/$label.pid" <<'PY'
+import os, plistlib, subprocess, sys
+p = plistlib.load(open(sys.argv[1], "rb"))
+env = dict(os.environ); env.update(p.get("EnvironmentVariables", {}))
+out = open(p["StandardOutPath"], "ab"); err = open(p["StandardErrorPath"], "ab")
+proc = subprocess.Popen(p["ProgramArguments"], cwd=p["WorkingDirectory"], env=env, stdout=out, stderr=err, stdin=subprocess.DEVNULL, start_new_session=True)
+open(sys.argv[2], "w").write(str(proc.pid))
+PY
+    if [[ "$force" -eq 1 ]]; then echo "kickstart -k" >> "$STATE/$label.kickstarts"; else echo "kickstart" >> "$STATE/$label.kickstarts"; fi
+    ;;
   *) echo "fake launchctl: unsupported $cmd" >&2; exit 1 ;;
 esac
 """
@@ -152,9 +175,69 @@ def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]
             -3:
         ] == "600"
         assert (home / "db" / "sniper-synthetic.db").exists()
-        # status shows running + heartbeat fields
+        # exactly one engine process was started by the install (defect 8: bootstrap + kickstart
+        # -k used to start two sessions seconds apart)
+        state_dir = Path(env["FAKE_LAUNCHD_STATE"])
+        assert not (state_dir / "com.solanasniper.test.kickstarts").exists()
+        boot = json.loads((home / "state" / "boot.json").read_text())
+        assert boot["starts"] == 1 and boot["previous_exit"] is None
+        log_text = (home / "logs" / "sniper.log").read_text(errors="replace")
+        assert log_text.count("portfolio_initialised") == 1 and "portfolio_restored" not in log_text
+        # One obvious context: the installed launcher, run from any directory without
+        # SNIPER_HOME in the environment, reads the same runtime home/database as the service.
+        launcher = Path(env["HOME"]) / ".local" / "bin" / "solana-sniper"
+        assert launcher.exists() and os.access(launcher, os.X_OK)
+        cli_env = {k: v for k, v in env.items() if k != "SNIPER_HOME"}
+        st_json = subprocess.run(
+            [str(launcher), "status", "--json"],
+            cwd=tmp_cwd(home),
+            env=cli_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        payload = json.loads(st_json.stdout)
+        assert payload["home"] == str(home), payload
+        assert payload["database_url"].endswith("/db/sniper-synthetic.db")
+        # it is the service's database (its session row is there), not some ./data file
+        assert any(sess["mode"] == "DRY_RUN" for sess in payload["sessions"]), payload
+        # the bare venv CLI without any hint falls back to the platform default, never ./data
+        venv_cli = Path(env["SNIPER_VENV"]) / "bin" / "solana-sniper"
+        default_home = subprocess.run(
+            [
+                str(Path(env["SNIPER_VENV"]) / "bin" / "python"),
+                "-c",
+                "from solana_sniper.config.paths import platform_default_home as p; print(p())",
+            ],
+            env=cli_env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+        bare = json.loads(
+            subprocess.run(
+                [str(venv_cli), "config-check", "--json"],
+                cwd=tmp_cwd(home),
+                env=cli_env,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+        )
+        assert bare["home"] == default_home and "/data/" not in bare["database_url"]
+        ver = subprocess.run(
+            [str(launcher), "version"], capture_output=True, text=True, check=True, env=env
+        )
+        assert "solana-sniper" in ver.stdout
+        for rc_name in (".zprofile", ".bash_profile"):
+            rc_file = Path(env["HOME"]) / rc_name
+            assert rc_file.read_text().count("solana-sniper: launcher on PATH") == 1
+        # status shows running + heartbeat fields + both pids
         st = run("status.sh", env)
-        assert "running" in st.stdout and "pid=" in st.stdout and "HEALTHY" in st.stdout, st.stdout
+        assert "running" in st.stdout and "service-pid=" in st.stdout and "HEALTHY" in st.stdout, (
+            st.stdout
+        )
+        assert "engine-pid=" in st.stdout and "starts=1" in st.stdout
         for needle in (
             "connection",
             "market data",
@@ -198,8 +281,33 @@ def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]
         # doctor passes with the synthetic config (network checks skipped)
         doc = run("doctor.sh", env)
         assert "checks passed" in doc.stdout, doc.stdout + doc.stderr
-        # logs.sh finds the files (non-following tail sanity: -F would block, so just check -n path)
-        assert (home / "logs" / "service.out.log").exists()
+        # logs.sh: default prints a tail and exits; --follow prints the hint and keeps running
+        tail = run("logs.sh", env, "-n", "5", "app")
+        assert tail.returncode == 0 and "showing the last 5 lines" in tail.stderr, tail.stderr
+        assert len(tail.stdout.strip().splitlines()) <= 5 and tail.stdout.strip()
+        bad = run("logs.sh", env, "-n", "x", check=False)
+        assert bad.returncode != 0 and "expects a number" in bad.stderr
+        follow = subprocess.Popen(
+            [str(REPO / "logs.sh"), "--follow", "-n", "2"],
+            cwd=REPO,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            time.sleep(1.5)
+            assert follow.poll() is None  # still following
+        finally:
+            follow.terminate()
+            _out, err = follow.communicate(timeout=10)
+        assert "Following logs. Press Ctrl+C to stop viewing logs" in err
+        assert "does not stop the trading service" in err
+        # the service is unaffected by the viewer going away
+        assert json.loads(status_file.read_text()).get("healthy") is True
+        # the restart is visible in the boot record
+        boot2 = json.loads((home / "state" / "boot.json").read_text())
+        assert boot2["starts"] == 2 and boot2["previous_exit"].startswith("clean")
         # update.sh refuses to run with local modifications and never restarts
         marker = REPO / "configs" / "default.yaml"
         original = marker.read_text()
@@ -213,6 +321,13 @@ def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]
             marker.write_text(original)
     finally:
         run("stop.sh", env, check=False)
+
+
+def tmp_cwd(home: Path) -> Path:
+    """A directory that is not the repository, to prove the CLI does not depend on cwd."""
+    d = home / "elsewhere"
+    d.mkdir(exist_ok=True)
+    return d
 
 
 def _alive(pid: int) -> bool:

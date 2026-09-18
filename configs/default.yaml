@@ -197,3 +197,25 @@ outcomes:                                  # forward outcome tracking = measurem
   silence_timeout_s: 900                   # finalise early if no data arrives for 15 minutes
   rug_liquidity_drop_pct: 0.6              # liquidity fell >= 60% from its peak -> "collapsed"
   max_followed: 400
+
+providers:
+  # Request governance per provider host (see infra/governor.py). These are the defaults; they
+  # are deliberately conservative for the free/public endpoints so a fresh install does not
+  # hammer api.mainnet-beta.solana.com into HTTP 429. With a Helius/QuickNode RPC URL the
+  # `helius` limits apply automatically when the hostname contains "helius".
+  rate_limits:
+    solana_rpc: {rate_per_s: 3.0, burst: 4, max_concurrent: 2, max_waiting: 40}
+    helius: {rate_per_s: 10.0, burst: 20, max_concurrent: 4, max_waiting: 100}
+    geckoterminal: {rate_per_s: 0.4, burst: 2, max_concurrent: 1, max_waiting: 4}
+    dexscreener: {rate_per_s: 4.0, burst: 8, max_concurrent: 3, max_waiting: 40}
+    jupiter: {rate_per_s: 1.0, burst: 3, max_concurrent: 2, max_waiting: 20}
+    jupiter_pro: {rate_per_s: 8.0, burst: 8, max_concurrent: 4, max_waiting: 40}
+    coingecko: {rate_per_s: 0.3, burst: 2, max_concurrent: 1, max_waiting: 4}
+    pumpfun: {rate_per_s: 2.0, burst: 4, max_concurrent: 2, max_waiting: 20}
+    circuit:
+      cooldown_min_s: 1.0      # first 429 without Retry-After; doubles per consecutive 429
+      cooldown_max_s: 120.0
+      fast_fail_wait_s: 3.0    # longer cooldowns fail fast: checks become UNKNOWN, engine continues
+      trip_after: 5            # consecutive failures that open the circuit breaker
+      open_s: 30.0             # doubles per trip, up to open_max_s; one probe when half-open
+      open_max_s: 300.0

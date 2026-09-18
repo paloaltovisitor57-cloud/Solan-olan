@@ -36,6 +36,12 @@ REGISTERED = "REGISTERED_FAKE_CRED_12345"
 UNREGISTERED = "UNREGISTERED_SENTINEL_XYZ"
 
 
+def _db_now() -> str:
+    """SQLite storage format SQLAlchemy uses for DateTime columns (raw INSERTs in tests must not
+    hand sqlite3 a datetime object: its default adapter is deprecated in Python 3.12)."""
+    return datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
 @pytest.fixture(autouse=True)
 def _clean_registry() -> None:
     registry.clear()
@@ -192,14 +198,14 @@ async def _seed(url: str, *, already_v2: bool) -> None:
                 "INSERT INTO fills (fill_id, session_id, signal_id, mint, side, filled_at, payload)"
                 " VALUES ('fill_sim','s','sig','m','BUY',:t,:p)"
             ),
-            {"t": datetime.now(tz=UTC), "p": json.dumps(fill)},
+            {"t": _db_now(), "p": json.dumps(fill)},
         )
         await conn.execute(
             text(
                 "INSERT INTO positions (position_id, session_id, mint, state, payload, updated_at)"
                 " VALUES ('pos_sim','s','m','OPEN',:p,:t)"
             ),
-            {"t": datetime.now(tz=UTC), "p": json.dumps(pos)},
+            {"t": _db_now(), "p": json.dumps(pos)},
         )
     await engine.dispose()
 

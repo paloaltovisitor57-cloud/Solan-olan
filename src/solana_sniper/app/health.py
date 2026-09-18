@@ -59,6 +59,13 @@ class HealthReporter:
     def add_probe(self, probe: ConnectionProbe) -> None:
         self._probes.append(probe)
 
+    def _provider_health(self) -> dict[str, Any]:
+        governor = getattr(self._runtime.http, "governor", None)
+        if governor is None:
+            return {}
+        result = governor.health()
+        return result if isinstance(result, dict) else {}
+
     # ---------------------------------------------------------------- snapshot
     def snapshot(self) -> dict[str, Any]:
         rt = self._runtime
@@ -102,20 +109,48 @@ class HealthReporter:
             for p in rt.account.open_positions
         ]
         last_error = stats.last_error
-        healthy = (
-            (last_tick_age is not None and last_tick_age <= 5.0)
-            and db_ok
-            and (any_connected or not self._probes)
-        )
+        # HEALTHY: everything works and the data is complete. DEGRADED: running, but something
+        # is missing (dropped research rows, a rate-limited or tripped provider). UNHEALTHY: the
+        # engine is not ticking, nothing is connected, or the database cannot be written.
+        problems: list[str] = []
+        degraded: list[str] = []
+        if last_tick_age is None or last_tick_age > 5.0:
+            problems.append("engine not ticking")
+        if self._probes and not any_connected:
+            problems.append("no provider connected")
+        if not db_ok:
+            problems.append("database write failures")
+        if db.dropped > 0:
+            degraded.append(
+                "storage dropped "
+                + ", ".join(f"{k}={v}" for k, v in sorted(db.dropped_by_kind.items()))
+            )
+        if rt.bus.dropped > 0:
+            degraded.append(f"event bus dropped {rt.bus.dropped} market events before storage")
+        provider_health = self._provider_health()
+        for name, info in provider_health.items():
+            if info.get("state") in ("RATE_LIMITED", "DEGRADED"):
+                degraded.append(f"provider {name} {str(info.get('state')).lower()}")
+            elif info.get("state") == "DOWN":
+                degraded.append(f"provider {name} down")
+        state = "UNHEALTHY" if problems else ("DEGRADED" if degraded else "HEALTHY")
+        healthy = state == "HEALTHY"
         return {
             "written_at": wall.isoformat(),
             "pid": os.getpid(),
+            "parent_pid": os.getppid(),
+            "starts": rt.boot.starts if rt.boot else None,
+            "previous_exit": rt.boot.previous_exit if rt.boot else None,
             "hostname": socket.gethostname(),
             "mode": str(engine.mode),
             "session_id": engine.session_id,
             "started_at": engine.started_at.isoformat() if engine.started_at else None,
             "uptime_s": _age(now, engine.started_at),
+            "state": state,
             "healthy": healthy,
+            "problems": problems,
+            "degraded": degraded,
+            "providers": provider_health,
             "records_verified_onchain": False,  # this software never reconciles fills on-chain
             "engine": {
                 "last_tick_age_s": last_tick_age,
@@ -141,6 +176,7 @@ class HealthReporter:
                 "failures": db.failures,
                 "dropped": db.dropped,
                 "queued": db.queue_size,
+                "integrity": db.integrity_summary(),
             },
             "tokens_monitored": len(monitored),
             "qualified": sum(1 for c in monitored if c.state is S.QUALIFIED),
@@ -200,15 +236,21 @@ class HealthReporter:
             data = self.snapshot()
         except Exception as exc:
             data = {"error": str(exc)}
-        data.update({"healthy": False, "stopped": True, "stop_reason": reason})
+        data.update({"healthy": False, "state": "STOPPED", "stopped": True, "stop_reason": reason})
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with __import__("contextlib").suppress(OSError):
             self._path.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
 
     async def run(self) -> None:
+        iteration = 0
         while True:
             try:
                 self.write_once()
+                iteration += 1
+                # persist the write-integrity counters about once a minute so a crash still
+                # leaves an honest record of how complete this session's data is
+                if iteration % max(1, int(60 / self._interval)) == 0:
+                    await self._runtime.repo.record_integrity()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

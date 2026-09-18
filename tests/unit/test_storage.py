@@ -241,11 +241,11 @@ async def test_persist_queue_drop_and_snapshot(repo: Repository, clock: ManualCl
     await repo.flush()
     latest = await repo.latest_portfolio_snapshot()
     assert latest is not None and latest.cash_eur == Decimal(0)
-    # queue full handling
-    repo._queue = __import__("asyncio").Queue(maxsize=1)
+    # telemetry budget exhausted: the drop is counted per kind and degrades the repository
+    repo._max_telemetry = 1
     repo.save_error(ErrorRecord(at=datetime.now(tz=UTC), component="a", message="1"))
     repo.save_error(ErrorRecord(at=datetime.now(tz=UTC), component="a", message="2"))
-    assert repo.dropped == 1
+    assert repo.dropped == 1 and repo.dropped_by_kind == {"error": 1} and repo.degraded
     await repo.close()
 
 

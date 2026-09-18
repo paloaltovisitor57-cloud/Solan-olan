@@ -56,6 +56,12 @@ def test_raw_ui_conversions_are_exact_for_several_decimal_scales() -> None:
         raw_to_ui(-1, 6)
 
 
+def _db_now() -> str:
+    """SQLite storage format SQLAlchemy uses for DateTime columns (raw INSERTs in tests must not
+    hand sqlite3 a datetime object: its default adapter is deprecated in Python 3.12)."""
+    return datetime.now(tz=UTC).strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
 def test_fill_rejects_inconsistent_units_and_fake_verification(clock: ManualClock) -> None:
     ok = make_fill(clock, side=SignalKind.BUY, token_amount=Decimal("1.5"), decimals=9)
     assert ok.token_amount_raw == 1_500_000_000 and ok.units is TokenUnits.UI
@@ -202,7 +208,7 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
                 "c": "sig",
                 "d": "m",
                 "e": "SELL",
-                "f": datetime.now(tz=UTC),
+                "f": _db_now(),
                 "g": json.dumps(legacy_fill),
             },
         )
@@ -217,7 +223,7 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
                 "c": "m",
                 "d": "OPEN",
                 "e": json.dumps(legacy_pos),
-                "f": datetime.now(tz=UTC),
+                "f": _db_now(),
             },
         )
         await conn.execute(
@@ -226,7 +232,7 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
                 " cash_after_eur, description, fee_eur, slippage_eur, realized_pnl_eur, provenance)"
                 " VALUES ('led_old', 1, 's', 'BUY', :t, '-15', '35', 'old', '0', '0', '0', NULL)"
             ),
-            {"t": datetime.now(tz=UTC)},
+            {"t": _db_now()},
         )
     await engine.dispose()
     assert await run_migrations(url) == [2, 3]

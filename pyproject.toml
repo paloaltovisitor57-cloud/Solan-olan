@@ -26,6 +26,7 @@ dependencies = [
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
+  "pytest-timeout>=2.3",
   "mypy>=1.10",
   "ruff>=0.5",
   "types-PyYAML",
@@ -79,3 +80,4 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-q"
 filterwarnings = ["error::RuntimeWarning"]
+markers = ["timeout: per-test timeout in seconds (pytest-timeout)"]

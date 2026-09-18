@@ -38,3 +38,36 @@ async def test_health_snapshot_and_atomic_write(harness: Harness, tmp_path: Path
     # the engine records its last error for the heartbeat
     harness.engine._error("test", "boom")
     assert reporter.snapshot()["last_error"]["message"] == "boom"
+
+
+async def test_dropped_research_rows_degrade_health_and_stopped_state(
+    harness: Harness, tmp_path: Path
+) -> None:
+    runtime = harness.runtime
+    reporter = HealthReporter(runtime, tmp_path / "state" / "status.json", stale_after_s=10)
+    for _ in range(6):
+        await harness.step(0.5)
+    snap = reporter.snapshot()
+    assert snap["state"] == "HEALTHY" and snap["healthy"] and snap["degraded"] == []
+    assert snap["database"]["integrity"]["complete"] is True
+    # exhaust the telemetry budget: the next research row is dropped and counted by kind
+    runtime.repo._max_telemetry = 0
+    for _ in range(4):
+        await harness.step(0.5)
+    snap = reporter.snapshot()
+    assert runtime.repo.dropped > 0
+    assert snap["state"] == "DEGRADED" and snap["healthy"] is False
+    assert any(d.startswith("storage dropped") for d in snap["degraded"])
+    assert snap["database"]["integrity"]["complete"] is False
+    assert snap["database"]["integrity"]["dropped_by_kind"] == runtime.repo.dropped_by_kind
+    # critical rows are never among the dropped kinds
+    assert not {"fill", "position", "ledger", "account_state", "outcome", "session"} & set(
+        runtime.repo.dropped_by_kind
+    )
+    reporter.write_final("test")
+    final = read_status(reporter._path)
+    assert final is not None and final["state"] == "STOPPED" and final["stopped"]
+    # the integrity record is persisted for later readers
+    await runtime.repo.record_integrity()
+    integrity = await runtime.repo.session_integrity(runtime.session_id)
+    assert integrity is not None and integrity["complete"] is False

@@ -196,3 +196,35 @@ async def test_forward_outcomes_are_measured_for_followed_candidates(harness: Ha
     assert sum(1 for r in rows2 if r.truncated) == persisted
     health_counts = (await repo.counts())["outcomes"]
     assert health_counts == len(rows2)
+
+
+async def test_rate_limited_enrichment_degrades_without_engine_errors(harness: Harness) -> None:
+    """A rate-limited metadata/holder provider is an expected transient: checks stay UNKNOWN,
+    nothing is recorded as an engine error, and the condition is counted."""
+    from solana_sniper.infra.http import RateLimitedError
+
+    engine = harness.engine
+
+    class Throttled:
+        name = "throttled-rpc"
+
+        async def get_authorities(self, mint: str) -> None:
+            raise RateLimitedError("rpc rate limited", retry_after_s=30.0)
+
+        async def get_holder_distribution(self, mint: str, pools: tuple[str, ...]) -> None:
+            raise RateLimitedError("rpc rate limited", retry_after_s=30.0)
+
+    from dataclasses import replace
+
+    engine.d = replace(engine.d, metadata=Throttled(), liquidity=Throttled())  # type: ignore[arg-type]
+    for _ in range(40):
+        await harness.step(0.5)
+    assert engine.stats.degraded_checks > 0
+    assert harness.runtime.metrics.counters["checks_degraded"] == engine.stats.degraded_checks
+    assert engine.stats.last_error is None  # never surfaced as an engine error
+    monitored = [c for c in engine.candidates.values() if c.checks is not None]
+    assert monitored
+    for cand in monitored:
+        assert cand.track.authorities is None
+        by_name = {r.name: r for r in cand.checks.results}  # type: ignore[union-attr]
+        assert by_name["authorities"].verdict.name == "UNKNOWN"

@@ -75,9 +75,18 @@ def resolve_config_path(explicit: Path | None) -> Path | None:
         if not p.exists():
             raise FileNotFoundError(f"{DEFAULT_CONFIG_ENV}={env_path} does not exist")
         return p
+    home = configured_home()
+    user_override = home / "config.yaml"
+    if user_override.exists():
+        return user_override
     for candidate in DEFAULT_CONFIG_PATHS:
         if candidate.exists():
             return candidate
+    # Not running from the checkout directory (e.g. `solana-sniper status` from $HOME): use the
+    # default config that ships with the installed package's checkout.
+    packaged = Path(__file__).resolve().parents[3] / "configs" / "default.yaml"
+    if packaged.exists():
+        return packaged
     return None
 
 
@@ -210,9 +219,8 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
 
     home = configured_home()
     env_files: list[str] = [".env"]
-    if home is not None:
-        ensure_home(home)
-        env_files.append(str(home / ENV_FILE))
+    ensure_home(home)
+    env_files.append(str(home / ENV_FILE))
     problems.extend(audit_environment(os.environ, [Path(f) for f in env_files if Path(f).exists()]))
     if problems:
         raise ConfigError(problems)
@@ -267,8 +275,7 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
         raise ConfigError(_validation_problems(exc)) from None
     settings.config_path = path
     settings.home = home
-    if home is not None:
-        apply_home(settings, home)
+    apply_home(settings, home)
     for secret in settings.secret_values():
         register_secret(secret)
     for url in settings.credential_urls():

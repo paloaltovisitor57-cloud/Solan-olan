@@ -33,10 +33,14 @@ def test_loader_relocates_state_under_sniper_home(
     assert (
         s2.storage.database_url == "sqlite+aiosqlite:////abs/custom.db"
     )  # absolute path respected
+    # without SNIPER_HOME the CLI resolves the same platform home the service scripts use, so
+    # `solana-sniper status` from any directory shows the installed runtime, never ./data
     monkeypatch.delenv("SNIPER_HOME")
     monkeypatch.delenv("SNIPER_STORAGE__DATABASE_URL")
+    monkeypatch.setenv("HOME", str(tmp_path / "userhome"))
     s3 = load_settings(Path("configs/default.yaml"))
-    assert s3.home is None and s3.storage.database_url.startswith("sqlite+aiosqlite:///./data/")
+    assert s3.home == platform_default_home() and str(s3.home).startswith(str(tmp_path))
+    assert s3.storage.database_url == f"sqlite+aiosqlite:///{s3.home / 'db' / 'sniper.db'}"
     assert platform_default_home().name in ("SolanaSniper", "solana-sniper")
 
 
@@ -81,7 +85,14 @@ def test_cli_config_check_and_migrate(tmp_path: Path, monkeypatch: pytest.Monkey
     runner = CliRunner()
     res = runner.invoke(app, ["config-check", "-c", "configs/synthetic.yaml"])
     assert res.exit_code == 0, res.output
-    assert "configuration ok" in res.output and str(tmp_path / "home") in res.output
+    assert "configuration ok" in res.output
+    # the path is asserted through the machine-readable output: Rich wraps long paths in the
+    # human table, so tests never depend on terminal presentation
+    res_json = runner.invoke(app, ["config-check", "-c", "configs/synthetic.yaml", "--json"])
+    assert res_json.exit_code == 0, res_json.output
+    payload = __import__("json").loads(res_json.output)
+    assert payload["ok"] and payload["home"] == str(tmp_path / "home")
+    assert payload["database_url"].endswith("/home/db/sniper-synthetic.db")
     bad = tmp_path / "bad.yaml"
     bad.write_text("entry:\n  min_score: 150\n")
     res_bad = runner.invoke(app, ["config-check", "-c", str(bad)])

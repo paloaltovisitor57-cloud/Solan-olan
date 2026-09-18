@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +12,15 @@ from solana_sniper.domain.enums import FillProvenance, SignalKind
 from solana_sniper.domain.models import Fill, new_id
 from solana_sniper.domain.money import ui_to_raw
 from solana_sniper.portfolio.accounting import PortfolioAccount
+
+
+@pytest.fixture(autouse=True)
+def isolated_runtime_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Every test gets its own runtime home so nothing touches the real one. Tests that need a
+    different home set SNIPER_HOME themselves (they run after this fixture)."""
+    home = tmp_path / "sniper-home"
+    monkeypatch.setenv("SNIPER_HOME", str(home))
+    return home
 
 
 @pytest.fixture

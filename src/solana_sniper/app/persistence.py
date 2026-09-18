@@ -23,6 +23,24 @@ from solana_sniper.domain.events import (
 )
 from solana_sniper.storage.repository import Repository
 
+_KIND_BY_EVENT = {
+    "TokenDiscovered": "token",
+    "SnapshotObserved": "observation",
+    "TradeObserved": "trade",
+    "FeaturesComputed": "feature",
+    "ChecksEvaluated": "check",
+    "Scored": "score",
+    "StateChanged": "transition",
+    "BuySignalCreated": "signal",
+    "SellSignalCreated": "signal",
+    "DecisionRecorded": "decision",
+    "QuoteObtained": "quote",
+    "PortfolioUpdated": "portfolio_snapshot",
+    "MilestoneReached": "milestone",
+    "ExecutionPrepared": "execution_record",
+    "ErrorOccurred": "error",
+}
+
 
 class PersistenceSubscriber:
     def __init__(
@@ -33,6 +51,13 @@ class PersistenceSubscriber:
         self._store_market = store_market
 
     async def handle(self, event: Event) -> None:
+        try:
+            self._dispatch(event)
+        except Exception as exc:  # serialization or builder failure: count it, never hide it
+            kind = _KIND_BY_EVENT.get(type(event).__name__, "unknown")
+            self._repo.note_dropped(kind, f"{type(exc).__name__}: {exc}"[:200])
+
+    def _dispatch(self, event: Event) -> None:
         r = self._repo
         if isinstance(event, TokenDiscovered):
             r.save_token(event.token)

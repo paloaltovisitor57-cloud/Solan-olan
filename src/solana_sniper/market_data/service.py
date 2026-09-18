@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from solana_sniper.config.settings import MarketDataConfig
 from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo, TradeEvent
+from solana_sniper.infra.http import ProviderUnavailableError, RateLimitedError
 from solana_sniper.market_data.base import (
     PollingMarketDataProvider,
     StreamingMarketDataProvider,
@@ -16,6 +17,7 @@ from solana_sniper.market_data.base import (
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
 from solana_sniper.telemetry.redaction import safe_exception
+from solana_sniper.telemetry.throttle import LogThrottle
 
 log = get_logger(__name__)
 
@@ -42,6 +44,7 @@ class MarketDataService:
         self._polling: list[PollingMarketDataProvider] = []
         self._streaming: list[StreamingMarketDataProvider] = []
         self._tracked: dict[str, TokenInfo] = {}
+        self._throttle = LogThrottle(60.0)
         self._sem = asyncio.Semaphore(max(1, config.max_concurrent_requests))
         self.polls = 0
         self.name = "market-data"
@@ -112,11 +115,21 @@ class MarketDataService:
                     snaps = await provider.fetch(batch)
                 except asyncio.CancelledError:
                     raise
+                except (RateLimitedError, ProviderUnavailableError) as exc:
+                    log.debug(
+                        "market_poll_throttled", provider=provider.name, error=safe_exception(exc)
+                    )
+                    return
                 except Exception as exc:
                     self._metrics.inc("provider_errors")
-                    log.warning(
-                        "market_poll_error", provider=provider.name, error=safe_exception(exc)
-                    )
+                    decision = self._throttle.hit(provider.name)
+                    if decision.log:
+                        log.warning(
+                            "market_poll_error",
+                            provider=provider.name,
+                            error=safe_exception(exc),
+                            suppressed_since_last=decision.suppressed,
+                        )
                     return
             if snaps:
                 self._last_success_at = datetime.now(tz=UTC)

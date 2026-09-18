@@ -77,6 +77,51 @@ MarketSource = Literal["dexscreener", "pumpportal", "synthetic"]
 QuoteSource = Literal["jupiter", "synthetic"]
 
 
+class HostLimit(StrictModel):
+    """Pacing and concurrency for one provider host (see infra/governor.py)."""
+
+    rate_per_s: float = Field(default=5.0, gt=0, le=1000)
+    burst: int = Field(default=10, ge=1, le=10000)
+    max_concurrent: int = Field(default=4, ge=1, le=256)
+    max_waiting: int = Field(default=64, ge=1, le=100000)
+
+
+class CircuitConfig(StrictModel):
+    """Cooldown and circuit-breaker behaviour shared by all providers."""
+
+    cooldown_min_s: float = Field(default=1.0, gt=0, le=3600)
+    cooldown_max_s: float = Field(default=120.0, gt=0, le=86400)
+    fast_fail_wait_s: float = Field(default=3.0, ge=0, le=600)
+    trip_after: int = Field(default=5, ge=1, le=1000)
+    open_s: float = Field(default=30.0, gt=0, le=86400)
+    open_max_s: float = Field(default=300.0, gt=0, le=86400)
+
+    @model_validator(mode="after")
+    def _order(self) -> CircuitConfig:
+        if self.cooldown_min_s > self.cooldown_max_s:
+            raise ValueError("cooldown_min_s must be <= cooldown_max_s")
+        if self.open_s > self.open_max_s:
+            raise ValueError("open_s must be <= open_max_s")
+        return self
+
+
+class RateLimitsConfig(StrictModel):
+    """Realistic defaults for the free/public endpoints. Public Solana RPC is the tightest:
+    getTokenLargestAccounts and getAccountInfo are throttled per IP, so the default keeps
+    at most two requests in flight at three per second and fails fast during cooldowns
+    (the affected checks stay UNKNOWN rather than blocking the engine)."""
+
+    solana_rpc: HostLimit = HostLimit(rate_per_s=3.0, burst=4, max_concurrent=2, max_waiting=40)
+    helius: HostLimit = HostLimit(rate_per_s=10.0, burst=20, max_concurrent=4, max_waiting=100)
+    geckoterminal: HostLimit = HostLimit(rate_per_s=0.4, burst=2, max_concurrent=1, max_waiting=4)
+    dexscreener: HostLimit = HostLimit(rate_per_s=4.0, burst=8, max_concurrent=3, max_waiting=40)
+    jupiter: HostLimit = HostLimit(rate_per_s=1.0, burst=3, max_concurrent=2, max_waiting=20)
+    jupiter_pro: HostLimit = HostLimit(rate_per_s=8.0, burst=8, max_concurrent=4, max_waiting=40)
+    coingecko: HostLimit = HostLimit(rate_per_s=0.3, burst=2, max_concurrent=1, max_waiting=4)
+    pumpfun: HostLimit = HostLimit(rate_per_s=2.0, burst=4, max_concurrent=2, max_waiting=20)
+    circuit: CircuitConfig = CircuitConfig()
+
+
 class ProvidersConfig(StrictModel):
     solana_rpc_url: str = "https://api.mainnet-beta.solana.com"
     solana_ws_url: str = "wss://api.mainnet-beta.solana.com"
@@ -94,6 +139,7 @@ class ProvidersConfig(StrictModel):
     http_max_connections: int = Field(default=32, ge=1, le=1000)
     ws_reconnect_min_s: float = Field(default=1.0, ge=0.1, le=300)
     ws_reconnect_max_s: float = Field(default=30.0, ge=0.1, le=3600)
+    rate_limits: RateLimitsConfig = RateLimitsConfig()
 
     @field_validator("wallet_public_key")
     @classmethod
@@ -443,6 +489,7 @@ class StorageConfig(StrictModel):
     database_url: str = "sqlite+aiosqlite:///./data/sniper.db"
     write_batch_size: int = Field(default=200, ge=1, le=100000)
     write_flush_interval_s: float = Field(default=0.5, gt=0, le=60)
+    max_queued_telemetry: int = Field(default=20_000, ge=100, le=1_000_000)
     observation_retention_days: int = Field(default=14, ge=0, le=3650)
 
 

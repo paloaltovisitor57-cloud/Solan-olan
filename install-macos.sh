@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # One-time macOS setup: python check → venv → deps → dirs → config → tests → launchd service.
-# Re-runnable. Usage: ./install-macos.sh [--skip-tests] [--skip-service] [--mode dry-run|signal]
+# Re-runnable. Usage: ./install-macos.sh [--skip-tests] [--skip-service] [--no-path] [--mode dry-run|signal]
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/common.sh"
 
-SKIP_TESTS=0; SKIP_SERVICE=0; MODE_OVERRIDE=""
+SKIP_TESTS=0; SKIP_SERVICE=0; MODE_OVERRIDE=""; NO_PATH=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --skip-tests) SKIP_TESTS=1 ;;
     --skip-service) SKIP_SERVICE=1 ;;
+    --no-path) NO_PATH=1 ;;
     --mode) shift; MODE_OVERRIDE="${1:-}" ;;
     -h|--help) sed -n '2,4p' "$0"; exit 0 ;;
     *) fail "unknown option: $1" ;;
@@ -83,4 +84,21 @@ else
   fi
 fi
 
-info "done. Useful commands: ./status.sh  ./logs.sh  ./cmd.sh b 1  ./stop.sh  ./update.sh  ./doctor.sh"
+# 8. `solana-sniper` on PATH
+LAUNCHER="$(install_launcher)"
+info "launcher: $LAUNCHER"
+if [[ "$NO_PATH" -eq 1 ]]; then
+  dim "PATH not modified (--no-path); use $LAUNCHER or $(venv_bin solana-sniper)"
+elif ensure_path_line; then
+  dim "$HOME/.local/bin is already on PATH"
+else
+  warn "added $HOME/.local/bin to PATH in ~/.zprofile and ~/.bash_profile; open a new terminal (or run: export PATH=\"\$HOME/.local/bin:\$PATH\")"
+fi
+
+info "done."
+echo
+echo "  Paper trade in the foreground (live data, no real funds, Ctrl+C to stop):"
+echo "      solana-sniper smoke-test"
+echo "      solana-sniper paper --bankroll-sol 1"
+echo "  Background service: solana-sniper service status | stop | start   (./status.sh ./logs.sh ./stop.sh still work)"
+echo "  Inspect: solana-sniper status | positions | portfolio | evaluate"

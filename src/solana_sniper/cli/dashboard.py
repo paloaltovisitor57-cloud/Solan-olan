@@ -6,6 +6,7 @@ import asyncio
 from collections import deque
 from datetime import datetime
 from decimal import Decimal
+from typing import TYPE_CHECKING
 
 from rich.console import Console, Group
 from rich.layout import Layout
@@ -16,10 +17,14 @@ from rich.text import Text
 
 from solana_sniper.alerts.base import Alert
 from solana_sniper.app.engine import Engine
+from solana_sniper.app.paper import PaperSession
 from solana_sniper.config.settings import DashboardConfig
 from solana_sniper.domain.enums import CandidateState as S
 from solana_sniper.domain.enums import SignalKind, Urgency
 from solana_sniper.domain.money import q_display
+
+if TYPE_CHECKING:
+    from solana_sniper.app.bootstrap import Runtime
 
 ACTIVE_STATES = {S.MONITORING, S.QUALIFIED, S.BUY_SIGNAL, S.AWAITING_CONFIRMATION, S.DATA_STALE}
 
@@ -30,10 +35,18 @@ def _eur(v: Decimal) -> str:
 
 class Dashboard:
     def __init__(
-        self, engine: Engine, config: DashboardConfig, console: Console | None = None
+        self,
+        engine: Engine,
+        config: DashboardConfig,
+        console: Console | None = None,
+        *,
+        paper: PaperSession | None = None,
+        runtime: Runtime | None = None,
     ) -> None:
         self._engine = engine
         self._cfg = config
+        self._paper = paper
+        self._runtime = runtime
         self._console = console or Console()
         self._alerts: deque[Alert] = deque(maxlen=50)
         self._messages: deque[str] = deque(maxlen=20)
@@ -48,7 +61,7 @@ class Dashboard:
     # ------------------------------------------------------------- rendering
     def render(self) -> Layout:
         layout = Layout()
-        header_size = 7
+        header_size = 9 if self._paper is not None else 7
         available = max(10, self._console.height - header_size)
         footer_size = min(self._cfg.event_lines + 2, max(5, available - 12))
         layout.split_column(
@@ -67,6 +80,8 @@ class Dashboard:
         return layout
 
     def _header(self) -> Panel:
+        if self._paper is not None:
+            return self._paper_header(self._paper)
         e = self._engine
         snap = e.d.account.snapshot(e.now())
         m = e.d.metrics
@@ -108,6 +123,69 @@ class Dashboard:
         )
         return Panel(
             Group(Text(line1), Text(line2), Text(line3), Text(line4, style="dim")), title=title
+        )
+
+    def _paper_header(self, meta: PaperSession) -> Panel:
+        e = self._engine
+        now = e.now()
+        snap = e.d.account.snapshot(now)
+        m = e.d.metrics
+        rate_now = e.d.fx.sol_eur()
+        sol_eq = snap.equity_eur / rate_now if rate_now > 0 else Decimal(0)
+        ret = (
+            float((snap.equity_eur - meta.bankroll_eur) / meta.bankroll_eur)
+            if meta.bankroll_eur > 0
+            else 0.0
+        )
+        uptime = (now - e.started_at).total_seconds() if e.started_at else 0.0
+        fx_flag = "" if e.d.fx.is_live else " (fallback rate)"
+        line1 = (
+            f"Session {meta.session_id}   uptime {_hms(uptime)}   "
+            f"SOL/EUR now €{rate_now:.2f}{fx_flag}"
+        )
+        line2 = (
+            f"Starting bankroll: {meta.bankroll_sol:.4f} SOL = {_eur(meta.bankroll_eur)} "
+            f"@ €{meta.sol_eur_start:.2f}/SOL ({meta.fx_source} rate at start)   "
+            f"Current equity: {_eur(snap.equity_eur)} = {sol_eq:.4f} SOL at current rate   "
+            f"Return: {ret:+.2%} (strategy P&L in EUR; SOL figure moves with FX)"
+        )
+        line3 = (
+            f"Cash {_eur(snap.cash_eur)}  Exposure {_eur(snap.open_exposure_eur)}  "
+            f"Realized {_eur(snap.realized_pnl_eur)}  Unrealized {_eur(snap.unrealized_pnl_eur)}  "
+            f"Fees {_eur(snap.fees_eur)}  Sim. slippage {_eur(snap.slippage_eur)}  "
+            f"Drawdown {snap.drawdown_pct:.1%}  W/L {snap.wins}/{snap.losses}  "
+            f"Trades {snap.wins + snap.losses}  Open {snap.open_positions}"
+        )
+        st = e.stats
+        line4 = (
+            f"Discovered {st.discovered}  Rejected {st.rejected}  Qualified {st.qualified}  "
+            f"Signals {st.signals}  Sim. buys {m.counters['positions_opened']}  "
+            f"Sim. sells {m.counters['positions_closed']}  Cancelled {st.cancelled}  "
+            f"Degraded checks {st.degraded_checks}  Rate limits {m.counters['rate_limited']}"
+        )
+        governor = getattr(self._runtime.http, "governor", None) if self._runtime else None
+        providers = governor.summary_line() if governor is not None else "n/a"
+        repo = e.d.repo
+        storage = (
+            f"{'OK' if not repo.degraded else 'DEGRADED'} queued {repo.queue_size} "
+            f"dropped {repo.dropped} failures {repo.failures}"
+        )
+        bus_dropped = self._runtime.bus.dropped if self._runtime else 0
+        line5 = f"Providers: {providers}   Storage: {storage}   Bus dropped: {bus_dropped}"
+        title = (
+            "[bold green]SOLANA SNIPER — PAPER / LIVE DATA[/]   "
+            "[bold red]Real transactions: DISABLED[/]   "
+            "[dim]simulated fills; nothing is signed or broadcast[/]"
+        )
+        return Panel(
+            Group(
+                Text(line1),
+                Text(line2),
+                Text(line3),
+                Text(line4),
+                Text(line5, style="dim" if "DEGRADED" not in storage else "bold red"),
+            ),
+            title=title,
         )
 
     def _candidates(self) -> Panel:
@@ -193,6 +271,7 @@ class Dashboard:
             "exec",
             "prov",
             "state",
+            "score",
         ):
             table.add_column(col, no_wrap=True)
         now = e.now()
@@ -201,7 +280,7 @@ class Dashboard:
             thr = e.d.monitor.trailing_threshold(p, cand.features if cand else None, now)
             pnl_style = "green" if p.unrealized_pnl_eur >= 0 else "red"
             table.add_row(
-                p.symbol or p.mint[:6],
+                f"{p.symbol or p.mint[:6]} {p.mint[:4]}…{p.mint[-4:]}",
                 f"{p.holding_seconds(now):.0f}s",
                 _eur(p.cost_basis_eur),
                 _eur(p.current_value_eur),
@@ -211,6 +290,7 @@ class Dashboard:
                 "Q" if p.value_is_executable else ("stale" if p.data_stale else "px"),
                 str(p.provenance)[:4] + ("" if p.units_known else "/units?"),
                 str(cand.state) if cand else str(p.state),
+                f"{cand.score.score:.0f}" if cand and cand.score else "-",
             )
         return Panel(
             table,
@@ -251,3 +331,8 @@ class Dashboard:
 
 def format_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
+
+
+def _hms(seconds: float) -> str:
+    total = int(max(0.0, seconds))
+    return f"{total // 3600:02d}:{(total % 3600) // 60:02d}:{total % 60:02d}"

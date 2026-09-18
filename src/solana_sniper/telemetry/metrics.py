@@ -52,6 +52,15 @@ class Metrics:
         "positions_closed",
         "ws_reconnects",
         "rate_limited",
+        "provider_retries",
+        "provider_backoffs",
+        "provider_fast_fails",
+        "provider_circuit_trips",
+        "provider_recoveries",
+        "checks_degraded",
+        "storage_dropped",
+        "outcomes_followed",
+        "outcomes_finalized",
     )
 
     LATENCIES = (

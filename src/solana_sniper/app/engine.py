@@ -78,6 +78,7 @@ from solana_sniper.execution.manual import DryRunExecution, OrderNotPendingError
 from solana_sniper.execution.preparer import TransactionPreparer
 from solana_sniper.features.engine import FeatureEngine
 from solana_sniper.filters.checks import TokenChecker
+from solana_sniper.infra.http import HttpError, ProviderUnavailableError, RateLimitedError
 from solana_sniper.market_data.service import MarketDataService
 from solana_sniper.market_data.tracker import TokenTrack, TokenTracker
 from solana_sniper.portfolio.accounting import (
@@ -98,6 +99,7 @@ from solana_sniper.strategy.scoring import EntryScorer
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics, PipelineTimer
 from solana_sniper.telemetry.redaction import safe_exception, scrub_text
+from solana_sniper.telemetry.throttle import LogThrottle
 from solana_sniper.token_analysis.base import LiquidityProvider, TokenMetadataProvider
 
 log = get_logger(__name__)
@@ -174,6 +176,7 @@ class EngineDeps:
 @dataclass(slots=True)
 class EngineStats:
     discovered: int = 0
+    degraded_checks: int = 0
     rejected: int = 0
     qualified: int = 0
     signals: int = 0
@@ -209,6 +212,7 @@ class Engine:
         self.last_tick_at: datetime | None = None
         self.last_snapshot_at: datetime | None = None
         self._snapshot_times: deque[datetime] = deque(maxlen=20_000)
+        self._enrichment_throttle = LogThrottle(60.0)
 
     # ------------------------------------------------------------------ utils
     @property
@@ -503,8 +507,13 @@ class Engine:
     async def _fetch_metadata(self, cand: Candidate) -> None:
         assert self.d.metadata is not None
         async with self._meta_sem:
+            if cand.sm.is_terminal:
+                return  # retired while waiting for a slot: do not spend a request on it
             try:
                 auth = await self.d.metadata.get_authorities(cand.mint)
+            except (RateLimitedError, ProviderUnavailableError, HttpError) as exc:
+                self._enrichment_degraded("metadata", cand, exc)
+                return
             except Exception as exc:
                 self._error("metadata", exc)
                 return
@@ -512,6 +521,23 @@ class Engine:
             cand.track.authorities = auth
             cand.dirty = True
         self._refresh_holders(cand, self.now(), force=True)
+
+    def _enrichment_degraded(self, what: str, cand: Candidate, exc: Exception) -> None:
+        """A rate-limited or unavailable provider is an expected transient: the affected checks
+        stay UNKNOWN (never PASS), the engine keeps running, and the condition is counted and
+        summarised rather than raised as an error per token."""
+        self.d.metrics.inc("checks_degraded")
+        self.stats.degraded_checks += 1
+        decision = self._enrichment_throttle.hit(what)
+        if decision.log:
+            log.warning(
+                "enrichment_degraded",
+                what=what,
+                mint=cand.mint,
+                error=safe_exception(exc),
+                occurrences=decision.total,
+                suppressed_since_last=decision.suppressed,
+            )
 
     def _refresh_holders(self, cand: Candidate, now: datetime, force: bool = False) -> None:
         if self.d.liquidity is None:
@@ -529,8 +555,13 @@ class Engine:
         assert self.d.liquidity is not None
         pools = tuple(p for p in (cand.track.token.pool_address,) if p)
         async with self._meta_sem:
+            if cand.sm.is_terminal:
+                return
             try:
                 dist = await self.d.liquidity.get_holder_distribution(cand.mint, pools)
+            except (RateLimitedError, ProviderUnavailableError, HttpError) as exc:
+                self._enrichment_degraded("holders", cand, exc)
+                return
             except Exception as exc:
                 self._error("holders", exc)
                 return

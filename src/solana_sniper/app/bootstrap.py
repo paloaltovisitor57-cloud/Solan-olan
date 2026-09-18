@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from websockets.asyncio.client import ClientConnection
@@ -22,12 +23,14 @@ from websockets.asyncio.client import ClientConnection
 from solana_sniper.alerts.service import AlertService
 from solana_sniper.alerts.terminal import TerminalAlertProvider
 from solana_sniper.alerts.webhooks import DiscordAlertProvider, TelegramAlertProvider
+from solana_sniper.app.bootrecord import BootInfo, record_start, record_stop
 from solana_sniper.app.bus import EventBus
 from solana_sniper.app.engine import Engine, EngineDeps
 from solana_sniper.app.health import ConnectionProbe, HealthReporter
+from solana_sniper.app.paper import PaperSession
 from solana_sniper.app.persistence import PersistenceSubscriber
 from solana_sniper.config.paths import STATUS_FILE, state_path
-from solana_sniper.config.settings import Settings
+from solana_sniper.config.settings import HostLimit, Settings
 from solana_sniper.discovery.dexscreener import DexScreenerDiscovery
 from solana_sniper.discovery.geckoterminal import GeckoTerminalDiscovery
 from solana_sniper.discovery.pumpportal import PumpPortalClient, PumpPortalDiscovery
@@ -40,6 +43,7 @@ from solana_sniper.execution.manual import DryRunExecution, ManualExecution
 from solana_sniper.execution.preparer import TransactionPreparer
 from solana_sniper.features.engine import FeatureEngine
 from solana_sniper.filters.checks import TokenChecker
+from solana_sniper.infra.governor import HostPolicy, ProviderGovernor
 from solana_sniper.infra.http import HttpClient
 from solana_sniper.market_data.dexscreener import DexScreenerMarketData
 from solana_sniper.market_data.pumpportal_stream import PumpPortalMarketData
@@ -75,6 +79,55 @@ log = get_logger(__name__)
 Task = Callable[[], Coroutine[Any, Any, None]]
 
 
+def build_fx(settings: Settings, http: HttpClient) -> FxProvider:
+    """Live CoinGecko FX with the configured fallback, or a static rate in synthetic mode."""
+    if settings.is_synthetic or settings.quotes.source == "synthetic":
+        return StaticFx(settings.portfolio.sol_eur_fallback)
+    return CoinGeckoFx(
+        http,
+        settings.providers.coingecko_base_url,
+        fallback_sol_eur=settings.portfolio.sol_eur_fallback,
+        refresh_s=settings.portfolio.fx_refresh_s,
+    )
+
+
+def build_governor(settings: Settings, metrics: Metrics) -> ProviderGovernor:
+    """Register every configured provider host with its pacing policy before any provider is
+    built, so provider-side hints never override the operator's configuration."""
+    rl = settings.providers.rate_limits
+    c = rl.circuit
+    gov = ProviderGovernor(metrics=metrics)
+
+    def policy(limit: HostLimit) -> HostPolicy:
+        return HostPolicy(
+            rate_per_s=limit.rate_per_s,
+            burst=limit.burst,
+            max_concurrent=limit.max_concurrent,
+            max_waiting=limit.max_waiting,
+            cooldown_min_s=c.cooldown_min_s,
+            cooldown_max_s=c.cooldown_max_s,
+            fast_fail_wait_s=c.fast_fail_wait_s,
+            trip_after=c.trip_after,
+            open_s=c.open_s,
+            open_max_s=c.open_max_s,
+        )
+
+    def host(url: str) -> str:
+        return urlparse(url).hostname or url
+
+    pv = settings.providers
+    rpc_host = host(pv.solana_rpc_url)
+    rpc_limit = rl.helius if "helius" in rpc_host else rl.solana_rpc
+    gov.register(rpc_host, "solana-rpc", policy(rpc_limit))
+    gov.register(host(pv.geckoterminal_base_url), "geckoterminal", policy(rl.geckoterminal))
+    gov.register(host(pv.dexscreener_base_url), "dexscreener", policy(rl.dexscreener))
+    gov.register(host(pv.jupiter_base_url), "jupiter", policy(rl.jupiter))
+    gov.register(host(pv.jupiter_pro_base_url), "jupiter-pro", policy(rl.jupiter_pro))
+    gov.register(host(pv.coingecko_base_url), "coingecko", policy(rl.coingecko))
+    gov.register(host(pv.pumpfun_api_url), "pumpfun", policy(rl.pumpfun))
+    return gov
+
+
 def new_session_id(mode: RunMode) -> str:
     stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     return f"{mode.lower()}-{stamp}-{uuid.uuid4().hex[:6]}"
@@ -101,8 +154,20 @@ class Runtime:
     quote_provider: QuoteProvider | None = None
     health: HealthReporter | None = None
     _tasks: list[asyncio.Task[None]] = field(default_factory=list)
+    boot: BootInfo | None = None
+    paper: PaperSession | None = None
 
     async def start(self) -> None:
+        self.boot = record_start(
+            self.settings.state_dir, session_id=self.session_id, mode=str(self.mode)
+        )
+        if self.boot.previous_exit and not self.boot.previous_exit.startswith("clean"):
+            log.warning(
+                "previous_run_ended_unclean",
+                starts=self.boot.starts,
+                previous_pid=self.boot.previous_pid,
+                previous_started_at=self.boot.previous_started_at,
+            )
         await self.repo.init()
         self.repo.start()
         await self.repo.start_session(str(self.mode), str(self.settings.config_path or ""))
@@ -186,7 +251,10 @@ class Runtime:
             await self.engine.finalize_outcomes()
             await self.repo.end_session()
         await self.repo.close()
-        await self.http.aclose()
+        with contextlib.suppress(Exception):
+            await self.http.aclose()
+        with contextlib.suppress(Exception):
+            record_stop(self.settings.state_dir, reason=reason)
         if self.health is not None:
             self.health.write_final(reason)
 
@@ -217,6 +285,7 @@ def build_runtime(
         max_connections=settings.providers.http_max_connections,
         metrics=metrics,
         transport=http_transport,
+        governor=build_governor(settings, metrics),
     )
     bus = EventBus()
     repo = Repository(
@@ -225,22 +294,14 @@ def build_runtime(
         batch_size=settings.storage.write_batch_size,
         flush_interval_s=settings.storage.write_flush_interval_s,
         metrics=metrics,
+        max_queued_telemetry=settings.storage.max_queued_telemetry,
     )
     account = PortfolioAccount(clock, session_id=sid, streak_window=settings.risk.streak_window)
     tracker = TokenTracker(settings.discovery.max_tracked_tokens)
     synthetic = settings.is_synthetic or settings.quotes.source == "synthetic"
 
     # ---- FX
-    fx: FxProvider
-    if synthetic:
-        fx = StaticFx(settings.portfolio.sol_eur_fallback)
-    else:
-        fx = CoinGeckoFx(
-            http,
-            settings.providers.coingecko_base_url,
-            fallback_sol_eur=settings.portfolio.sol_eur_fallback,
-            refresh_s=settings.portfolio.fx_refresh_s,
-        )
+    fx = build_fx(settings, http)
 
     engine_holder: dict[str, Engine] = {}
 
@@ -360,6 +421,7 @@ def build_runtime(
             settings.providers.solana_rpc_url,
             clock,
             helius_api_key=helius.get_secret_value() if helius else None,
+            metrics=metrics,
         )
         metadata, liquidity = rpc, rpc
 

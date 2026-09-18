@@ -27,6 +27,55 @@ terminal dashboard, SQLite persistence with restart recovery, replay and a `doct
 
 ---
 
+## PAPER TRADING (start here)
+
+Paper mode uses **live Solana market data**, **no real funds**, **no keys, no signing, no
+broadcasting**, and gives every experiment its own isolated database so an old account can never
+leak into a freshly requested bankroll.
+
+```bash
+cd ~/Solan-olan
+git pull
+./install-macos.sh              # venv, deps, tests, launcher on PATH, background service (dry-run)
+solana-sniper smoke-test        # real-network check of every provider (latency, rate limits, advice)
+solana-sniper paper --bankroll-sol 1
+```
+
+`paper --bankroll-sol 1` fetches the live SOL/EUR rate once, records it in the session metadata,
+converts the bankroll to the EUR accounting currency and starts the full pipeline (discovery →
+checks → scoring → sizing → round-trip quote → simulated fill → monitoring → exit → ledger) in the
+foreground with a dashboard. The original bankroll is never redefined by later FX moves; the
+dashboard additionally shows the *current* SOL equivalent of the equity, labelled as such.
+Ctrl+C stops discovery, flushes storage, marks the session ended, finalises outcome tracking,
+closes WebSockets/HTTP/SQLite and prints a `SESSION COMPLETE` summary (including storage errors,
+dropped writes, provider outages and rate limits; if data integrity was compromised the summary
+says so prominently instead of presenting the numbers as trustworthy).
+
+```bash
+solana-sniper paper --bankroll-eur 100            # bankroll in EUR instead of SOL
+solana-sniper paper --bankroll-sol 1 --name test-a
+solana-sniper paper --list                        # experiments in this runtime home
+solana-sniper paper --resume <session-id>         # explicit resume; never implicit
+solana-sniper paper --allow-fallback-fx ...       # only if no live rate is available; marked as fallback
+```
+
+Session ids look like `paper-20260918-132500-1sol-3f9a1c` (or `…-test-a` with `--name`); the
+database is `<runtime home>/db/paper/<session-id>.db`, the log
+`<runtime home>/logs/paper/<session-id>.log`. Inspect a session (running or finished) with the
+global `--paper` option:
+
+```bash
+solana-sniper --paper <session-id> status        # portfolio + counts of that experiment
+solana-sniper --paper <session-id> positions --all
+solana-sniper --paper <session-id> portfolio
+solana-sniper --paper <session-id> evaluate      # outcome hit rates of that experiment (§12)
+```
+
+The background service (launchd) remains available and secondary:
+`solana-sniper service start|stop|restart|status|logs|install` wrap the scripts below.
+
+---
+
 ## 1. Architecture
 
 ```
@@ -198,6 +247,10 @@ solana-sniper portfolio                     # ledger view
 solana-sniper inspect <MINT>                # transitions, checks, scores, signals for a token
 solana-sniper sessions                      # recorded sessions
 solana-sniper evaluate                      # what happened after each decision (hit rates per score bucket)
+solana-sniper paper --bankroll-sol 1        # PAPER: live data, simulated fills, isolated session (start here)
+solana-sniper smoke-test                    # real-network provider check with latency and rate-limit advice
+solana-sniper service status|start|stop     # background launchd service (wrappers around the scripts)
+solana-sniper --home ~/somewhere status     # explicit runtime home; default = the service's platform home
 solana-sniper replay <SESSION_ID>           # re-run recorded observations through the engine
 solana-sniper doctor                        # config, db, network, providers, credentials, quote test
 ```
@@ -291,6 +344,14 @@ database migrations, runs the test suite, renders and installs
 `~/Library/LaunchAgents/com.solanasniper.agent.plist`, bootstraps it and waits for a healthy
 heartbeat. It is safe to re-run.
 
+**One runtime context.** The service, the shell scripts, the installed `solana-sniper` launcher
+and the bare venv CLI all resolve the same runtime home: `$SNIPER_HOME` if set, else the platform
+default below. `solana-sniper status`, `doctor`, `positions` and `portfolio` therefore show the
+installed runtime from any directory, never some `./data` file, and print which home/database
+they use. `--home PATH` (or `SNIPER_HOME`) overrides it explicitly; `--config` still selects the
+YAML. The installer puts a launcher in `~/.local/bin/solana-sniper` (pinned to the install-time
+home) and adds `~/.local/bin` to PATH in `~/.zprofile`/`~/.bash_profile` once (`--no-path` skips).
+
 **Runtime state lives outside the repository** (never committed):
 
 ```
@@ -323,7 +384,7 @@ There is no mode that signs or broadcasts transactions.
 | `./logs.sh [-n N] [app\|out\|err\|all]` | follow the rotating app log and launchd stdout/stderr |
 | `./cmd.sh <command>` | queue a confirmation for the headless service (`b N`, `s N`, `r N`, `i N`, `p`, `c`) |
 | `./update.sh` | fast-forward pull, reinstall deps, `config-check`, `migrate`, run tests; restarts the service **only** if every step passes |
-| `./doctor.sh` | verifies python, venv, directories, env file permissions, git-ignore, plist validity, launchd state, heartbeat, then runs `solana-sniper doctor` (config, db, network, providers, quotes) |
+| `./doctor.sh` | verifies python, venv, directories, env file permissions, repository safety (secrets and runtime data git-ignored and untracked, checked with paths relative to the checkout so it is right on a fresh clone with no `data/`), plist validity, launchd state, heartbeat, then runs `solana-sniper doctor` |
 
 **launchd behaviour.** `RunAtLoad` starts the agent at login; `KeepAlive.SuccessfulExit=false`
 restarts it after a crash (non-zero exit) with a 10 s throttle but leaves it stopped after
@@ -336,11 +397,23 @@ synchronously before the engine continues; on start the portfolio and open posit
 from the database, re-subscribed to market data and monitored again (`restored open position …`
 appears in the log). Pending confirmations do not survive a restart and are regenerated live.
 
+**Logs.** `./logs.sh` prints the last 50 lines of every log and exits; `./logs.sh -n 100`,
+`./logs.sh app|out|err` narrow it; `./logs.sh -f` (or `--follow`) keeps following and says so:
+"Following logs. Press Ctrl+C to stop viewing logs; this does not stop the trading service."
+
+**Exactly one process.** `install-macos.sh`/`start.sh` bootstrap the agent once (`RunAtLoad`) and
+only `kickstart` (never `-k`) if nothing is running; the earlier `kickstart -k` killed the fresh
+process and produced two sessions seconds apart. `./status.sh` shows the launchd service pid, the
+engine pid from `state/boot.json`, the number of starts, how the previous run ended
+(`clean: <reason>` or `unclean (no stop marker)`) and launchd's last exit code, and warns when
+service and engine pids differ.
+
 **Verification status.** The scripts were developed and exercised on Linux with a mocked
-`launchctl`/`plutil`/`uname` (full install → start → status → cmd → stop → restart flow, plist
-rendering validated with `plistlib`), plus `shellcheck` and `bash -n`. They have **not** been run
-on a real macOS machine from this environment; `./doctor.sh` and `./status.sh` will show
-immediately if launchd or a provider is unhappy on your Mac.
+`launchctl`/`plutil`/`uname` whose `kickstart` semantics match the real one (full install →
+one running instance → status → cmd → stop → restart → doctor → logs flow, plist rendering
+validated with `plistlib`), plus `shellcheck` and `bash -n`. They have **not** been run on a
+real macOS machine from this environment; `solana-sniper smoke-test`, `./doctor.sh` and
+`./status.sh` will show immediately if launchd or a provider is unhappy on your Mac.
 
 ## 12. Outcome measurement (`evaluate`)
 
@@ -382,7 +455,43 @@ solana-sniper evaluate                      # then look at what the scores were 
 solana-sniper evaluate --session <ID> --min-observations 10
 ```
 
-## 13. Quality gates
+## 13. Reliability: storage integrity and provider governance
+
+**Storage.** Every write has a record class. CRITICAL rows (fills, positions, ledger, account
+state, sessions, outcomes) are committed synchronously at their boundary and never queued.
+IMPORTANT rows (tokens, token state, signals, decisions, execution records, milestones) go
+through the background writer but are never dropped. TELEMETRY rows (observations, trades,
+features, checks, scores, quotes, portfolio snapshots, transitions, errors) are research data:
+they are dropped only when the writer is more than `storage.max_queued_telemetry` rows behind,
+and every drop is counted per kind, logged once per kind per minute, exposed in the heartbeat
+(`database.integrity`), turns health to `DEGRADED`, is persisted per session in
+`session_integrity`, and makes `evaluate` print `INCOMPLETE DATA` for that session. Batches are
+serialised, token rows use `INSERT … ON CONFLICT(mint) DO UPDATE` (first sighting keeps its
+provenance, later sightings fill missing metadata, `final_state` is never wiped), session rows
+upsert so an explicit resume works, a batch the writer already dequeued is committed even if
+shutdown cancels it, and a row that cannot be built or serialised is counted as a failed write of
+its kind instead of vanishing. SQLite opens with a 30 s busy timeout so `status` from another
+terminal never turns into "database is locked".
+
+**Providers.** Every HTTP request passes through the provider governor (`infra/governor.py`):
+per-host pacing (token bucket), concurrency cap, bounded waiting queue, cooldown on HTTP 429
+(Retry-After when supplied, else exponential backoff with jitter that resets on success),
+fast-fail while a cooldown or open circuit is longer than the caller should wait, circuit breaker
+after repeated failures with a single half-open probe, and a health state per provider
+(`HEALTHY / RATE_LIMITED / DEGRADED / DOWN`) with counters for rate limits, retries, backoffs,
+fast fails, trips and recoveries. Rate limits are summarised (first occurrence, then one line
+per minute with the count) instead of one warning per request. A rate-limited optional
+enrichment (mint authorities, holder distribution) leaves the affected checks `UNKNOWN`, never
+`PASS`, is counted as `checks_degraded`, and is not an engine error. Identical RPC calls are
+coalesced and cached briefly. Defaults are in `configs/default.yaml` under
+`providers.rate_limits`; with a Helius RPC URL the `helius` limits apply.
+
+**Health states.** `HEALTHY` (everything works, data complete), `DEGRADED` (running, but
+research rows were dropped or a provider is rate limited / tripped), `UNHEALTHY` (engine not
+ticking, nothing connected, or database writes failing), `STOPPED`. `solana-sniper health`
+exits 0 only for HEALTHY.
+
+## 14. Quality gates
 
 ```bash
 pytest            # unit + integration (synthetic end-to-end, invariants, recovery)
@@ -390,10 +499,15 @@ ruff check .
 mypy              # --strict via pyproject
 ```
 
-## 14. Limitations (honest list)
+## 15. Limitations (honest list)
 
 * Live provider connectivity could **not** be exercised from the build sandbox (all external hosts
-  were blocked by its egress policy). The adapters are written against the documented API shapes and
+  were blocked by its egress policy). The first real Mac run exposed defects the mocked suite had
+  missed (duplicate-mint UNIQUE errors, silent write drops, RPC/GeckoTerminal 429 storms, a false
+  `.gitignore` failure, a Rich-wrapped path assertion, a CLI that ignored the service's runtime
+  home, a log viewer that never returned, and a double service start); each now has a regression
+  test that failed before the fix. `solana-sniper smoke-test` is the real-network check to run
+  on the Mac before a paper session. The adapters are written against the documented API shapes and
   tested with fixtures, and the *live composition* (PumpPortal WS + GeckoTerminal + DexScreener +
   Solana RPC + Jupiter + CoinGecko) is driven end to end in `tests/integration/test_live_pipeline_mocked.py`
   with the transports mocked. Real endpoints may still differ in detail; `solana-sniper doctor`

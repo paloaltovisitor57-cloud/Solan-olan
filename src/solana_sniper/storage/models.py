@@ -23,6 +23,40 @@ class SessionRow(Base):
     notes: Mapped[str] = mapped_column(Text, default="")
 
 
+class SessionIntegrityRow(Base):
+    """Write-integrity counters of a session: how many rows the background writer dropped or
+    failed to commit, per record kind. `complete` is False when any research data is missing."""
+
+    __tablename__ = "session_integrity"
+    session_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    dropped_total: Mapped[int] = mapped_column(Integer, default=0)
+    failed_total: Mapped[int] = mapped_column(Integer, default=0)
+    dropped_by_kind: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    failed_by_kind: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    complete: Mapped[bool] = mapped_column(Boolean, default=True)
+    last_error: Mapped[str | None] = mapped_column(String(200), nullable=True)
+
+
+class PaperSessionRow(Base):
+    """Metadata of a paper-trading experiment: the requested bankroll, the SOL/EUR rate captured
+    at session start and where it came from. The original bankroll is never redefined later."""
+
+    __tablename__ = "paper_sessions"
+    session_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    requested: Mapped[str] = mapped_column(String(32))
+    bankroll_sol: Mapped[str] = mapped_column(String(40))
+    bankroll_eur: Mapped[str] = mapped_column(String(40))
+    sol_eur_start: Mapped[str] = mapped_column(String(40))
+    fx_source: Mapped[str] = mapped_column(String(16))
+    fx_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    config_path: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    database_url: Mapped[str] = mapped_column(String(512))
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class TokenRow(Base):
     __tablename__ = "tokens"
     mint: Mapped[str] = mapped_column(String(64), primary_key=True)

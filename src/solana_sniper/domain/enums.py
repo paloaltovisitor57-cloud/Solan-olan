@@ -157,4 +157,5 @@ class Venue(StrEnum):
 class RunMode(StrEnum):
     LIVE = "LIVE"
     DRY_RUN = "DRY_RUN"
+    PAPER = "PAPER"  # live data, simulated fills, isolated per-session database
     REPLAY = "REPLAY"

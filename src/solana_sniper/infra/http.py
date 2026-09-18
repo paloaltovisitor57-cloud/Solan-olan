@@ -4,17 +4,28 @@ from __future__ import annotations
 
 import asyncio
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import httpx
 
 from solana_sniper.infra.backoff import Backoff
+from solana_sniper.infra.governor import ProviderGovernor, ProviderUnavailableError
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
 from solana_sniper.telemetry.redaction import safe_url, scrub_text
 
 log = get_logger(__name__)
+
+__all__ = [
+    "HttpClient",
+    "HttpError",
+    "HttpResult",
+    "MalformedResponseError",
+    "ProviderUnavailableError",
+    "RateLimitedError",
+    "TokenBucket",
+]
 
 
 class HttpError(Exception):
@@ -83,6 +94,7 @@ class HttpClient:
         max_connections: int = 32,
         metrics: Metrics | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
+        governor: ProviderGovernor | None = None,
     ) -> None:
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(timeout_s, connect=min(timeout_s, 5.0)),
@@ -93,11 +105,17 @@ class HttpClient:
             transport=transport,
             follow_redirects=True,
         )
-        self._buckets: dict[str, TokenBucket] = {}
         self._metrics = metrics
+        self.governor = governor or ProviderGovernor(metrics=metrics)
+        self._hinted: set[str] = set()
 
     def set_rate_limit(self, host: str, rate_per_s: float, burst: int) -> None:
-        self._buckets[host] = TokenBucket(rate_per_s, burst)
+        """Provider-supplied pacing hint. Configured policies (registered by the bootstrap
+        before providers are built) take precedence; the hint applies only to unknown hosts."""
+        if self.governor.has_policy(host):
+            return
+        policy = self.governor.policy_for(host)
+        self.governor.set_policy(host, replace(policy, rate_per_s=rate_per_s, burst=burst))
 
     async def aclose(self) -> None:
         await self._client.aclose()
@@ -141,80 +159,93 @@ class HttpClient:
     ) -> HttpResult:
         host = httpx.URL(url).host
         endpoint = safe_url(url)
-        bucket = self._buckets.get(host)
+        gov = self.governor
         backoff = Backoff(minimum=0.5, maximum=8.0)
         last_error: Exception | None = None
         for attempt in range(retries + 1):
-            if bucket is not None:
-                await bucket.acquire()
-            started = time.perf_counter()
-            try:
-                response = await self._client.request(
-                    method,
-                    url,
-                    params=params,
-                    json=json,
-                    headers=headers,
-                    timeout=timeout_s if timeout_s is not None else httpx.USE_CLIENT_DEFAULT,
-                )
-            except httpx.TransportError as exc:  # timeouts, network, proxy, protocol errors
-                last_error = HttpError(
-                    f"{method} {endpoint}: {type(exc).__name__}: {scrub_text(str(exc))}",
-                    retryable=True,
-                    endpoint=endpoint,
-                )
-                if self._metrics:
-                    self._metrics.inc("provider_errors")
-                if attempt < retries:
-                    await asyncio.sleep(backoff.next_delay())
-                    continue
-                raise last_error from exc
-            latency_ms = (time.perf_counter() - started) * 1000.0
-            if self._metrics:
-                self._metrics.observe("provider_latency", latency_ms)
-            if response.status_code == 429:
-                if self._metrics:
-                    self._metrics.inc("rate_limited")
-                retry_after = _parse_retry_after(response.headers.get("retry-after"))
-                last_error = RateLimitedError(f"{endpoint} rate limited", retry_after_s=retry_after)
-                if attempt < retries:
-                    await asyncio.sleep(
-                        retry_after if retry_after is not None else backoff.next_delay()
+            if attempt:
+                gov.on_retry(host)
+            delay: float | None = None
+            async with gov.slot(host):  # may raise ProviderUnavailableError without sending
+                started = time.perf_counter()
+                try:
+                    response = await self._client.request(
+                        method,
+                        url,
+                        params=params,
+                        json=json,
+                        headers=headers,
+                        timeout=timeout_s if timeout_s is not None else httpx.USE_CLIENT_DEFAULT,
                     )
-                    continue
-                raise last_error
-            if response.status_code >= 500:
-                last_error = HttpError(
-                    f"{method} {endpoint}: HTTP {response.status_code}",
-                    status=response.status_code,
-                    retryable=True,
-                    endpoint=endpoint,
-                )
-                if self._metrics:
-                    self._metrics.inc("provider_errors")
-                if attempt < retries:
-                    await asyncio.sleep(backoff.next_delay())
-                    continue
-                raise last_error
-            if response.status_code >= 400:
-                # Response bodies are never included: providers may echo the request (and its key).
-                raise HttpError(
-                    f"{method} {endpoint}: HTTP {response.status_code}",
-                    status=response.status_code,
-                    endpoint=endpoint,
-                )
-            try:
-                payload = response.json()
-            except ValueError as exc:
-                raise MalformedResponseError(
-                    f"{method} {endpoint}: invalid JSON", endpoint=endpoint
-                ) from exc
-            return HttpResult(
-                status=response.status_code,
-                json=payload,
-                latency_ms=latency_ms,
-                headers=dict(response.headers),
-            )
+                except httpx.TransportError as exc:  # timeouts, network, proxy, protocol errors
+                    last_error = HttpError(
+                        f"{method} {endpoint}: {type(exc).__name__}: {scrub_text(str(exc))}",
+                        retryable=True,
+                        endpoint=endpoint,
+                    )
+                    if self._metrics:
+                        self._metrics.inc("provider_errors")
+                    gov.on_failure(host, type(exc).__name__)
+                    if attempt < retries:
+                        delay = backoff.next_delay()
+                    else:
+                        raise last_error from exc
+                else:
+                    latency_ms = (time.perf_counter() - started) * 1000.0
+                    if self._metrics:
+                        self._metrics.observe("provider_latency", latency_ms)
+                    if response.status_code == 429:
+                        retry_after = _parse_retry_after(response.headers.get("retry-after"))
+                        cooldown = gov.on_rate_limited(host, retry_after)
+                        last_error = RateLimitedError(
+                            f"{endpoint} rate limited", retry_after_s=cooldown
+                        )
+                        # The governor waits out a short cooldown on the next slot; a longer
+                        # one is reported to the caller so optional work degrades to UNKNOWN.
+                        if attempt < retries and cooldown <= gov.policy_for(host).fast_fail_wait_s:
+                            delay = 0.0
+                        else:
+                            raise last_error
+                    elif response.status_code >= 500:
+                        last_error = HttpError(
+                            f"{method} {endpoint}: HTTP {response.status_code}",
+                            status=response.status_code,
+                            retryable=True,
+                            endpoint=endpoint,
+                        )
+                        if self._metrics:
+                            self._metrics.inc("provider_errors")
+                        gov.on_failure(host, f"HTTP {response.status_code}")
+                        if attempt < retries:
+                            delay = backoff.next_delay()
+                        else:
+                            raise last_error
+                    elif response.status_code >= 400:
+                        # Bodies are never included: providers may echo the request (and key).
+                        # A client error is ours, not the provider's health.
+                        raise HttpError(
+                            f"{method} {endpoint}: HTTP {response.status_code}",
+                            status=response.status_code,
+                            endpoint=endpoint,
+                        )
+                    else:
+                        try:
+                            payload = response.json()
+                        except ValueError as exc:
+                            gov.on_failure(host, "invalid JSON")
+                            raise MalformedResponseError(
+                                f"{method} {endpoint}: invalid JSON", endpoint=endpoint
+                            ) from exc
+                        gov.on_success(host)
+                        return HttpResult(
+                            status=response.status_code,
+                            json=payload,
+                            latency_ms=latency_ms,
+                            headers=dict(response.headers),
+                        )
+            # sleep outside the slot so a backing-off request does not hold a concurrency permit
+            if delay:
+                await asyncio.sleep(delay)
         raise last_error or HttpError("unreachable")
 
 

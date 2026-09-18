@@ -19,7 +19,13 @@ if [[ -f "$ENV_FILE" ]]; then
 else
   warnc "no env file at $ENV_FILE (optional API keys not configured)"
 fi
-if git -C "$REPO_DIR" check-ignore -q "$REPO_DIR/.env" 2>/dev/null && git -C "$REPO_DIR" check-ignore -q "$REPO_DIR/data" 2>/dev/null; then pass "git ignores .env and data/"; else failc ".env or data/ not git-ignored"; fi
+if repo_ignores_secrets "$REPO_DIR"; then pass "git ignores secrets and runtime data (.env, sniper.env, data/, logs/) and none is tracked"
+else
+  case $? in
+    1) failc "repository unsafe: $REPO_SAFETY_REASON" ;;
+    *) warnc "cannot verify .gitignore: $REPO_SAFETY_REASON" ;;
+  esac
+fi
 if is_macos; then
   if [[ -f "$PLIST_PATH" ]]; then
     if plutil -lint "$PLIST_PATH" >/dev/null 2>&1; then pass "plist valid: $PLIST_PATH"; else failc "plist invalid: $PLIST_PATH"; fi

@@ -66,7 +66,7 @@ async def test_rate_limit_honours_retry_after(monkeypatch: pytest.MonkeyPatch) -
     client = make_client(handler)
     res = await client.get_json("https://example.com/x", retries=1)
     assert res.json == []
-    assert sleeps == [2.0]
+    assert len(sleeps) == 1 and sleeps[0] == pytest.approx(2.0, abs=0.05)  # Retry-After honoured
     client2 = make_client(lambda r: httpx.Response(429))
     with pytest.raises(RateLimitedError):
         await client2.get_json("https://example.com/x", retries=0)

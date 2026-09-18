@@ -1,12 +1,11 @@
 """Persistent runtime home: database, logs and runtime state live outside the repository.
 
-Resolution order:
-1. `SNIPER_HOME` environment variable (set by the launchd service and the shell scripts)
-2. nothing → paths in the YAML config are used as-is (relative to the working directory)
-
-Platform defaults offered to the install scripts:
-* macOS:  ~/Library/Application Support/SolanaSniper
-* other:  ~/.local/share/solana-sniper
+Resolution order (identical for the launchd service, the shell scripts and the bare CLI, so
+`solana-sniper status` always looks at the same database the service writes):
+1. `SNIPER_HOME` environment variable (`--home` on the CLI sets it for the process)
+2. the platform default:
+   * macOS:  ~/Library/Application Support/SolanaSniper
+   * other:  ~/.local/share/solana-sniper
 """
 
 from __future__ import annotations
@@ -30,11 +29,17 @@ def platform_default_home() -> Path:
     return Path.home() / ".local" / "share" / "solana-sniper"
 
 
-def configured_home() -> Path | None:
+def configured_home() -> Path:
+    """`SNIPER_HOME` if set, else the platform default. Never None: every process, service or
+    CLI, resolves the same runtime home unless told otherwise."""
     raw = os.environ.get(HOME_ENV)
-    if not raw:
-        return None
-    return Path(raw).expanduser()
+    if raw:
+        return Path(raw).expanduser()
+    return platform_default_home()
+
+
+def home_source() -> str:
+    return "SNIPER_HOME" if os.environ.get(HOME_ENV) else "platform default"
 
 
 def ensure_home(home: Path) -> Path:

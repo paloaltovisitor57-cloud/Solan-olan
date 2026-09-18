@@ -5,6 +5,7 @@ from __future__ import annotations
 from decimal import Decimal
 from io import StringIO
 
+import pytest
 from rich.console import Console
 
 from solana_sniper.alerts.base import Alert
@@ -109,3 +110,107 @@ async def test_reject_buy_cools_down(harness: Harness) -> None:
         await harness.step(0.5)
         buys = [o.mint for o in ex.pending() if o.kind is SignalKind.BUY]
         assert len(buys) == len(set(buys))
+
+
+async def test_paper_dashboard_header_and_final_report(harness: Harness) -> None:
+    from datetime import UTC, datetime
+
+    from solana_sniper.app.paper import PaperSession
+    from solana_sniper.app.report import build_session_report
+
+    engine = harness.engine
+    runtime = harness.runtime
+    meta = PaperSession(
+        session_id="paper-test",
+        name=None,
+        created_at=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+        requested="1 SOL",
+        bankroll_sol=Decimal(1),
+        bankroll_eur=Decimal(50),  # the harness account starts with €50
+        sol_eur_start=Decimal(50),
+        fx_source="synthetic",
+        fx_at=datetime(2026, 3, 1, 12, 0, tzinfo=UTC),
+        config_path=None,
+        database_url=runtime.settings.storage.database_url,
+    )
+    for _ in range(400):
+        await harness.step(0.5)
+        if runtime.account.open_positions:
+            break
+    console = Console(file=StringIO(), width=200, height=60, force_terminal=False)
+    dashboard = Dashboard(engine, runtime.settings.dashboard, console, paper=meta, runtime=runtime)
+    console.print(dashboard.render())
+    out = console.file.getvalue()  # type: ignore[attr-defined]
+    for needle in (
+        "PAPER / LIVE DATA",
+        "Real transactions: DISABLED",
+        "Session paper-test",
+        "Starting bankroll: 1.0000 SOL = €50.00 @ €50.00/SOL (synthetic rate at start)",
+        "Current equity:",
+        "SOL at current rate",
+        "Return:",
+        "Cash €",
+        "Exposure €",
+        "Realized",
+        "Unrealized",
+        "Sim. slippage",
+        "Drawdown",
+        "W/L",
+        "Discovered",
+        "Rejected",
+        "Qualified",
+        "Signals",
+        "Sim. buys",
+        "Sim. sells",
+        "Providers:",
+        "Storage: OK",
+        "OPEN POSITIONS",
+        "score",
+    ):
+        assert needle in out, needle
+    report = build_session_report(runtime, meta, reason="test")
+    snap = runtime.account.snapshot(runtime.clock.now())
+    assert report.finished_equity_eur == snap.equity_eur
+    assert report.return_pct == pytest.approx(float((snap.equity_eur - Decimal(50)) / Decimal(50)))
+    assert report.trades == runtime.account.wins + runtime.account.losses
+    assert report.open_positions == len(runtime.account.open_positions)
+    assert report.signals == engine.stats.signals >= 1
+    assert report.sol_equivalent == snap.equity_eur / runtime.engine.d.fx.sol_eur()
+    assert report.data_complete and report.dropped_writes == 0 and report.storage_failures == 0
+    text = "\n".join(report.lines())
+    assert "SESSION COMPLETE" in text and "Session:           paper-test" in text
+    # integrity is reflected honestly once anything was dropped
+    runtime.repo._max_telemetry = 0
+    for _ in range(4):
+        await harness.step(0.5)
+    degraded = build_session_report(runtime, meta, reason="test")
+    assert not degraded.data_complete and degraded.dropped_writes > 0
+    assert "DATA INTEGRITY COMPROMISED" in degraded.lines()[0]
+
+
+def test_service_and_paper_commands_are_documented() -> None:
+    from typer.testing import CliRunner
+
+    from solana_sniper.cli.main import app
+
+    runner = CliRunner(env={"COLUMNS": "200"})
+    root = runner.invoke(app, ["--help"])
+    assert root.exit_code == 0
+    for cmd in ("paper", "smoke-test", "service", "evaluate", "status", "doctor"):
+        assert cmd in root.output, cmd
+    svc = runner.invoke(app, ["service", "--help"])
+    assert svc.exit_code == 0
+    for cmd in ("start", "stop", "restart", "status", "logs", "install"):
+        assert cmd in svc.output, cmd
+    paper = runner.invoke(app, ["paper", "--help"])
+    assert paper.exit_code == 0
+    for opt in (
+        "--bankroll-sol",
+        "--bankroll-eur",
+        "--name",
+        "--resume",
+        "--allow-fallback-fx",
+        "--list",
+    ):
+        assert opt in paper.output, opt
+    assert "NO real funds" in paper.output and "Nothing is ever signed" in paper.output

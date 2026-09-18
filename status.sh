@@ -5,7 +5,12 @@ if is_macos && [[ -n "$(launchctl_bin)" ]]; then
   if service_loaded; then
     pid="$(service_pid)"
     if [[ -n "$pid" && "$pid" != "0" ]]; then
-      printf '%sSERVICE%s   running  label=%s pid=%s\n' "$c_green" "$c_reset" "$SERVICE_LABEL" "$pid"
+      engine_pid="$(boot_field pid)"; starts="$(boot_field starts)"; prev="$(boot_field previous_exit)"
+      printf '%sSERVICE%s   running  label=%s service-pid=%s engine-pid=%s starts=%s previous-exit=%s launchd-last-exit=%s\n' \
+        "$c_green" "$c_reset" "$SERVICE_LABEL" "$pid" "${engine_pid:-?}" "${starts:-?}" "${prev:-none}" "$(service_last_exit)"
+      if [[ -n "$engine_pid" && "$engine_pid" != "$pid" ]]; then
+        printf '%sWARN%s      service pid %s differs from engine pid %s (restart in progress or stale record)\n' "$c_yellow" "$c_reset" "$pid" "$engine_pid"
+      fi
     else
       printf '%sSERVICE%s   loaded but not running (crash loop or throttled?) label=%s\n' "$c_yellow" "$c_reset" "$SERVICE_LABEL"
     fi

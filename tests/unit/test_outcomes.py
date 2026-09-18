@@ -316,3 +316,30 @@ def test_evaluate_command_on_empty_database(tmp_path: Path) -> None:
     res = CliRunner(env={"COLUMNS": "200"}).invoke(app, ["evaluate", "-c", str(config)])
     assert res.exit_code == 0, res.output
     assert "no usable outcomes (0 rows recorded" in res.output
+
+
+def test_evaluate_flags_sessions_with_incomplete_data(tmp_path: Path) -> None:
+    config = _config_for(tmp_path, "incomplete.db")
+
+    async def seed() -> None:
+        repo = Repository(
+            f"sqlite+aiosqlite:///{tmp_path}/incomplete.db",
+            session_id="holey",
+            max_queued_telemetry=1,
+        )
+        await repo.init()
+        repo.start()
+        await repo.start_session("PAPER", None)
+        from solana_sniper.domain.models import ErrorRecord
+
+        for i in range(3):
+            repo.save_error(ErrorRecord(at=T0, component="t", message=str(i)))
+        await repo.save_outcomes_now([make_outcome(mint=f"m{i}") for i in range(6)])
+        await repo.end_session()
+        await repo.close()
+
+    asyncio.run(seed())
+    res = CliRunner(env={"COLUMNS": "200"}).invoke(app, ["evaluate", "-c", str(config)])
+    assert res.exit_code == 0, res.output
+    assert "INCOMPLETE DATA" in res.output and "holey" in res.output
+    assert "forward outcomes: 6 tokens" in res.output

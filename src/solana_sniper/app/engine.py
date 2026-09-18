@@ -93,6 +93,7 @@ from solana_sniper.risk.engine import RiskEngine, SizingInputs
 from solana_sniper.risk.milestones import MilestoneTracker
 from solana_sniper.storage.repository import Repository
 from solana_sniper.strategy.gate import EntryGate
+from solana_sniper.strategy.outcomes import OutcomeTracker
 from solana_sniper.strategy.scoring import EntryScorer
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics, PipelineTimer
@@ -166,6 +167,7 @@ class EngineDeps:
     liquidity: LiquidityProvider | None
     market: MarketDataService
     tracker: TokenTracker
+    outcomes: OutcomeTracker
     metrics: Metrics
 
 
@@ -292,6 +294,8 @@ class Engine:
         return True
 
     async def on_snapshot(self, snap: MarketSnapshot) -> None:
+        # Outcome tracking outlives the candidate: keep measuring after reject/expire/close.
+        self.d.outcomes.observe(snap)
         track = self.d.tracker.add_snapshot(snap)
         if track is None:
             return
@@ -302,6 +306,10 @@ class Engine:
         cand = self.candidates.get(snap.mint)
         if cand is not None:
             cand.dirty = True
+            if self.d.outcomes.start(
+                snap.mint, cand.symbol, cand.track.token.source, snap, self.now()
+            ):
+                self.d.metrics.inc("outcomes_followed")
         self.d.bus.publish(SnapshotObserved(snap))
 
     async def on_trade(self, trade: TradeEvent) -> None:
@@ -344,6 +352,7 @@ class Engine:
                 elif not cand.sm.is_terminal:
                     await self._evaluate(cand, now)
             self._housekeeping(now)
+            await self._finalize_due_outcomes(now)
             await self._portfolio_snapshot(now)
         except asyncio.CancelledError:
             raise
@@ -439,6 +448,7 @@ class Engine:
         score = self.d.scorer.score(features, checks, now, rt)
         cand.score = score
         self.d.bus.publish(Scored(score))
+        self.d.outcomes.note_score(cand.mint, score.score)
         decision = self.d.gate.decide(features, checks, score)
         cand.gate_reasons = decision.reasons
         if decision.fatal:
@@ -452,6 +462,10 @@ class Engine:
                 self.d.metrics.inc("tokens_qualified")
                 self._transition(cand, S.QUALIFIED, f"score {score.score:.0f}")
                 self.timer.mark(cand.mint, "qualified")
+                latest = cand.track.latest
+                self.d.outcomes.note_qualified(
+                    cand.mint, latest.price_native if latest else None, now
+                )
                 self._refresh_holders(cand, now)
             if cand.state is S.QUALIFIED:
                 await self._maybe_signal(cand, features, now)
@@ -475,6 +489,7 @@ class Engine:
         if state is S.REJECTED:
             self.stats.rejected += 1
             self.d.metrics.inc("tokens_rejected")
+            self.d.outcomes.note_rejected(cand.mint, reason)
         if self._transition(cand, state, reason):
             self._log_event(f"{state.lower()} {cand.symbol or cand.mint[:8]}: {reason}", "DEBUG")
             self.d.repo.save_token_state(cand.mint, str(state))
@@ -652,6 +667,7 @@ class Engine:
         cand.features, cand.checks, cand.score = features, checks, score
         self.d.bus.publish(ChecksEvaluated(checks))
         self.d.bus.publish(Scored(score))
+        self.d.outcomes.note_score(cand.mint, score.score)
         decision = self.d.gate.decide(features, checks, score)
         cand.gate_reasons = decision.reasons
         if decision.fatal:
@@ -728,6 +744,7 @@ class Engine:
         self.stats.signals += 1
         self.stats.last_signal_at = now
         self.d.metrics.inc("signals_generated")
+        self.d.outcomes.note_signal(cand.mint)
         self.timer.mark(cand.mint, "signal")
         self.d.repo.save_signal(signal, str(SignalStatus.PENDING))
         self.d.bus.publish(BuySignalCreated(signal))
@@ -836,6 +853,7 @@ class Engine:
         await self._persist_fill(fill, position)
         self.d.bus.publish(FillRecorded(fill))
         self.d.bus.publish(PositionOpened(position))
+        self.d.outcomes.note_entered(position.mint)
         if cand is not None:
             cand.position_id = position.position_id
             cand.order = None
@@ -867,6 +885,7 @@ class Engine:
         await self._persist_fill(res.fill, position)
         self.d.bus.publish(FillRecorded(res.fill))
         self.d.bus.publish(PositionClosed(position))
+        self.d.outcomes.note_closed(position.mint, position.pnl_pct, str(sig.reason))
         if cand is not None:
             cand.sell_order = None
             cand.exit_quote = None
@@ -1137,7 +1156,26 @@ class Engine:
                     self.candidates.pop(cand.mint, None)
                     self.d.tracker.untrack(cand.mint)
                     self.timer.forget(cand.mint)
-                    self._spawn(self.d.market.unwatch(cand.mint), f"unwatch-{cand.mint[:6]}")
+                    if not self.d.outcomes.is_following(cand.mint):
+                        self._spawn(self.d.market.unwatch(cand.mint), f"unwatch-{cand.mint[:6]}")
+
+    async def _finalize_due_outcomes(self, now: datetime) -> None:
+        done = self.d.outcomes.finalize_due(now)
+        if not done:
+            return
+        await self.d.repo.save_outcomes_now(done)  # measurement rows commit immediately
+        self.d.metrics.inc("outcomes_finalized", len(done))
+        for o in done:
+            if o.mint not in self.candidates:
+                self._spawn(self.d.market.unwatch(o.mint), f"unwatch-{o.mint[:6]}")
+
+    async def finalize_outcomes(self) -> int:
+        """Shutdown: persist every outcome still in flight (marked truncated when the horizon
+        had not elapsed) so a short session still leaves measurable rows behind."""
+        done = self.d.outcomes.finalize_all(self.now())
+        if done:
+            await self.d.repo.save_outcomes_now(done)
+        return len(done)
 
     async def _portfolio_snapshot(self, now: datetime) -> None:
         interval = self.settings.portfolio.snapshot_interval_s

@@ -238,3 +238,34 @@ class ErrorRow(Base):
     component: Mapped[str] = mapped_column(String(64))
     message: Mapped[str] = mapped_column(Text)
     detail: Mapped[str] = mapped_column(Text, default="")
+
+
+class OutcomeRow(Base):
+    """Forward outcome of an observed token (see strategy/outcomes.py). Measurement only."""
+
+    __tablename__ = "outcomes"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    session_id: Mapped[str] = mapped_column(String(40), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(32))
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    finalized_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    horizon_s: Mapped[float] = mapped_column(Float)
+    observations: Mapped[int] = mapped_column(Integer)
+    max_multiple: Mapped[float] = mapped_column(Float)
+    qualified_multiple: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_multiple: Mapped[float] = mapped_column(Float)
+    max_drawdown_from_peak: Mapped[float] = mapped_column(Float)
+    time_to_peak_s: Mapped[float | None] = mapped_column(Float, nullable=True)
+    best_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    qualified: Mapped[bool] = mapped_column(Boolean)
+    signalled: Mapped[bool] = mapped_column(Boolean)
+    entered: Mapped[bool] = mapped_column(Boolean)
+    closed_pnl_pct: Mapped[float | None] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    liquidity_collapsed: Mapped[bool] = mapped_column(Boolean)
+    reject_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
+    simulated: Mapped[bool] = mapped_column(Boolean)
+    truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)

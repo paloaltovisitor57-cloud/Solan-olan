@@ -56,6 +56,7 @@ from solana_sniper.storage.models import (
     LedgerRow,
     MilestoneRow,
     ObservationRow,
+    OutcomeRow,
     PortfolioSnapshotRow,
     PositionRow,
     QuoteRow,
@@ -67,6 +68,7 @@ from solana_sniper.storage.models import (
     TradeRow,
 )
 from solana_sniper.storage.serialization import dataclass_from_dict, to_jsonable
+from solana_sniper.strategy.outcomes import Outcome
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
 from solana_sniper.telemetry.redaction import safe_exception
@@ -128,6 +130,8 @@ class Repository:
         self._interval = flush_interval_s
         self._metrics = metrics
         self._task: asyncio.Task[None] | None = None
+        self._inflight: asyncio.Task[None] | None = None
+        self._pending: list[WriteOp] = []  # dequeued by the writer, not yet handed to a commit
         self._stopping = False
         self.dropped = 0
         self.failures = 0
@@ -157,30 +161,57 @@ class Repository:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+            await self._await_inflight()
+            await self.flush()  # anything enqueued while the last batches were committing
         await self._engine.dispose()
 
+    async def _await_inflight(self) -> None:
+        if self._inflight is not None and not self._inflight.done():
+            await asyncio.shield(self._inflight)
+
     async def flush(self) -> None:
-        ops: list[WriteOp] = []
+        """Commit everything enqueued before this call, including the batch the background
+        writer may currently be holding."""
+        ops = self._take_pending()
         while not self._queue.empty():
             ops.append(self._queue.get_nowait())
+        await self._await_inflight()
         if ops:
             await self._run_batch(ops)
 
+    def _take_pending(self) -> list[WriteOp]:
+        ops, self._pending = self._pending, []
+        return ops
+
     async def _writer(self) -> None:
         while True:
-            ops: list[WriteOp] = []
             try:
                 first = await asyncio.wait_for(self._queue.get(), timeout=self._interval)
-                ops.append(first)
             except TimeoutError:
                 continue
+            self._pending.append(first)
+            cancelled = False
             deadline = time.monotonic() + self._interval
-            while len(ops) < self._batch and time.monotonic() < deadline:
+            try:
+                while len(self._pending) < self._batch and time.monotonic() < deadline:
+                    try:
+                        self._pending.append(self._queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                cancelled = True
+            # Ops taken off the queue are committed exactly once: flush() may take them over
+            # while they are being collected, and once handed to a commit the commit runs as
+            # its own task that close()/flush() await even if this loop is cancelled.
+            ops = self._take_pending()
+            if ops:
+                self._inflight = asyncio.create_task(self._run_batch(ops), name="storage-batch")
                 try:
-                    ops.append(self._queue.get_nowait())
-                except asyncio.QueueEmpty:
-                    await asyncio.sleep(0.01)
-            await self._run_batch(ops)
+                    await asyncio.shield(self._inflight)
+                except asyncio.CancelledError:
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
 
     async def _run_batch(self, ops: Sequence[WriteOp]) -> None:
         started = time.perf_counter()
@@ -582,6 +613,65 @@ class Repository:
 
         self.persist(op)
 
+    def _outcome_op(self, o: Outcome) -> WriteOp:
+        async def op(s: AsyncSession) -> None:
+            s.add(
+                OutcomeRow(
+                    session_id=self.session_id,
+                    mint=o.mint,
+                    symbol=o.symbol,
+                    source=o.source,
+                    first_seen_at=o.first_seen_at,
+                    finalized_at=o.finalized_at,
+                    horizon_s=o.horizon_s,
+                    observations=o.observations,
+                    max_multiple=o.max_multiple,
+                    qualified_multiple=o.qualified_multiple,
+                    final_multiple=o.final_multiple,
+                    max_drawdown_from_peak=o.max_drawdown_from_peak,
+                    time_to_peak_s=o.time_to_peak_s,
+                    best_score=o.best_score,
+                    qualified=o.qualified,
+                    signalled=o.signalled,
+                    entered=o.entered,
+                    closed_pnl_pct=o.closed_pnl_pct,
+                    exit_reason=o.exit_reason,
+                    liquidity_collapsed=o.liquidity_collapsed,
+                    reject_reason=o.reject_reason,
+                    simulated=o.simulated,
+                    truncated=o.truncated,
+                    payload=to_jsonable(o),
+                )
+            )
+
+        return op
+
+    def save_outcome(self, o: Outcome) -> None:
+        """Queue one forward-outcome row (background writer; may be dropped under backlog)."""
+        self.persist(self._outcome_op(o))
+
+    async def save_outcomes_now(self, outcomes: Sequence[Outcome]) -> None:
+        """Commit forward-outcome rows immediately, bypassing the bounded background queue.
+        These rows are the measurement record, so they must not be dropped when the queue is
+        full of telemetry."""
+        ops = [self._outcome_op(o) for o in outcomes]
+        if ops:
+            await self._run_batch(ops)
+
+    async def outcomes(
+        self, *, limit: int = 100_000, session_id: str | None = None
+    ) -> list[Outcome]:
+        async with self._sessions() as s:
+            stmt = select(OutcomeRow)
+            if session_id is not None:
+                stmt = stmt.where(OutcomeRow.session_id == session_id)
+            rows = (
+                (await s.execute(stmt.order_by(OutcomeRow.first_seen_at.asc()).limit(limit)))
+                .scalars()
+                .all()
+            )
+        return [dataclass_from_dict(Outcome, r.payload) for r in rows]
+
     def save_error(self, e: ErrorRecord) -> None:
         async def op(s: AsyncSession) -> None:
             s.add(
@@ -915,6 +1005,7 @@ class Repository:
                 ("positions", PositionRow),
                 ("ledger", LedgerRow),
                 ("errors", ErrorRow),
+                ("outcomes", OutcomeRow),
             ):
                 out[name] = len((await s.execute(select(model))).scalars().all())
         return out

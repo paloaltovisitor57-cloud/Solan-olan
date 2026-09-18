@@ -403,6 +403,92 @@ def sessions(config: ConfigOpt = None) -> None:
 
 
 @app.command()
+def evaluate(
+    config: ConfigOpt = None,
+    include_truncated: bool = typer.Option(
+        False, help="Also count rows finalised early at shutdown (before their horizon elapsed)."
+    ),
+    min_observations: int = typer.Option(
+        5, min=1, help="Ignore rows with fewer market observations than this."
+    ),
+    session: str | None = typer.Option(None, help="Restrict to one recorded session id."),
+) -> None:
+    """Hit rates per score bucket from recorded forward outcomes. Measurement, never a forecast."""
+    from solana_sniper.strategy.evaluation import MIN_MEANINGFUL_N, MULTIPLES, summarize
+
+    async def go() -> None:
+        repo, _ = _open_repo(config)
+        await repo.init()
+        rows = await repo.outcomes(session_id=session)
+        await repo.close()
+        report = summarize(
+            rows, include_truncated=include_truncated, min_observations=min_observations
+        )
+        if report.used_rows == 0:
+            console.print(
+                f"no usable outcomes ({report.total_rows} rows recorded, "
+                f"{report.excluded_truncated} truncated, {report.excluded_short} too short). "
+                "Run the engine for longer than outcomes.horizon_s and try again."
+            )
+            return
+        horizon = f"{report.horizon_s:.0f}s" if report.horizon_s else "mixed"
+        table = Table(
+            title=f"forward outcomes: {report.used_rows} tokens, horizon {horizon} "
+            f"(passive observation from first sight; excludes slippage, fees, fill risk)"
+        )
+        table.add_column("group")
+        table.add_column("n", justify="right")
+        for m in MULTIPLES:
+            table.add_column(f">={m:g}x", justify="right")
+        table.add_column("median peak", justify="right")
+        table.add_column("median end", justify="right")
+        table.add_column("median dd", justify="right")
+        table.add_column("liq. pulled", justify="right")
+        table.add_column("closed pnl", justify="right")
+        for b in report.buckets:
+            if b.n == 0:
+                continue
+            cells = [b.name, str(b.n)]
+            for m in MULTIPLES:
+                lo, hi = b.interval(m)
+                cells.append(f"{b.rate(m):.0%} [{lo:.0%}-{hi:.0%}]")
+            cells.append(f"{b.median_max_multiple:.2f}x" if b.median_max_multiple else "-")
+            cells.append(f"{b.median_final_multiple:.2f}x" if b.median_final_multiple else "-")
+            cells.append(f"{b.median_drawdown:.0%}" if b.median_drawdown is not None else "-")
+            cells.append(f"{b.rug_rate:.0%}")
+            cells.append(
+                f"{b.median_closed_pnl_pct:+.0%} (n={b.entered})"
+                if b.median_closed_pnl_pct is not None
+                else "-"
+            )
+            style = "" if b.meaningful else "dim"
+            table.add_row(*cells, style=style)
+        console.print(table)
+        console.print(
+            f"excluded: {report.excluded_truncated} truncated at shutdown, "
+            f"{report.excluded_short} with < {min_observations} observations. "
+            f"Rows: {report.simulated_rows} simulated/dry-run, {report.live_rows} live-data."
+        )
+        console.print(
+            f"[bold]Read this carefully:[/bold] groups with n < {MIN_MEANINGFUL_N} are dimmed "
+            "because their rates are noise; brackets are 95% Wilson intervals. "
+            "Multiples are what a passive observer saw from the first snapshot, not what a "
+            "buyer would have realised. Past outcomes do not predict future ones."
+        )
+        if report.all_simulated:
+            console.print(
+                "[yellow]Every row here is from a simulated or synthetic run. It says nothing "
+                "about real Solana tokens.[/yellow]"
+            )
+        elif report.mixed_provenance:
+            console.print(
+                "[yellow]Simulated and live rows are mixed; use --session to separate them.[/yellow]"
+            )
+
+    asyncio.run(go())
+
+
+@app.command()
 def health(
     config: ConfigOpt = None,
     json_output: Annotated[

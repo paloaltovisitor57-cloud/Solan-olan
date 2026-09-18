@@ -459,6 +459,16 @@ class DryRunConfig(StrictModel):
     auto_confirm_sells: bool = True
 
 
+class OutcomesConfig(StrictModel):
+    """Forward outcome tracking of every observed candidate (measurement, not prediction)."""
+
+    enabled: bool = True
+    horizon_s: float = Field(default=3600.0, ge=60, le=86400)
+    silence_timeout_s: float = Field(default=900.0, ge=30, le=86400)
+    rug_liquidity_drop_pct: float = Field(default=0.6, gt=0, le=1)
+    max_followed: int = Field(default=400, ge=1, le=5000)
+
+
 class DashboardConfig(StrictModel):
     enabled: bool = True
     refresh_hz: float = Field(default=4.0, ge=0.1, le=60)
@@ -505,6 +515,7 @@ class Settings(BaseSettings):
     telemetry: TelemetryConfig = TelemetryConfig()
     dry_run: DryRunConfig = DryRunConfig()
     dashboard: DashboardConfig = DashboardConfig()
+    outcomes: OutcomesConfig = OutcomesConfig()
     config_path: Path | None = Field(default=None, exclude=True)
     home: Path | None = Field(default=None, exclude=True)  # SNIPER_HOME, if configured
 

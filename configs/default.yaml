@@ -190,3 +190,10 @@ dashboard:
   refresh_hz: 4
   top_candidates: 8
   event_lines: 14
+
+outcomes:                                  # forward outcome tracking = measurement, not prediction
+  enabled: true
+  horizon_s: 3600                          # follow every observed token for 60 minutes
+  silence_timeout_s: 900                   # finalise early if no data arrives for 15 minutes
+  rug_liquidity_drop_pct: 0.6              # liquidity fell >= 60% from its peak -> "collapsed"
+  max_followed: 400

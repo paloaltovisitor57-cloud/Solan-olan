@@ -63,6 +63,7 @@ from solana_sniper.risk.engine import RiskEngine
 from solana_sniper.risk.milestones import MilestoneTracker
 from solana_sniper.storage.repository import Repository
 from solana_sniper.strategy.gate import EntryGate
+from solana_sniper.strategy.outcomes import OutcomeTracker
 from solana_sniper.strategy.scoring import EntryScorer
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
@@ -182,6 +183,7 @@ class Runtime:
             )
             for p in self.account.open_positions:
                 await self.repo.save_position_now(p)
+            await self.engine.finalize_outcomes()
             await self.repo.end_session()
         await self.repo.close()
         await self.http.aclose()
@@ -406,6 +408,7 @@ def build_runtime(
         liquidity=liquidity,
         market=market,
         tracker=tracker,
+        outcomes=OutcomeTracker(settings.outcomes, simulated=mode is not RunMode.LIVE),
         metrics=metrics,
     )
     engine = Engine(settings, deps, mode=mode, session_id=sid)

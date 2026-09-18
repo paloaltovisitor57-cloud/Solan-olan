@@ -197,6 +197,7 @@ solana-sniper candidates
 solana-sniper portfolio                     # ledger view
 solana-sniper inspect <MINT>                # transitions, checks, scores, signals for a token
 solana-sniper sessions                      # recorded sessions
+solana-sniper evaluate                      # what happened after each decision (hit rates per score bucket)
 solana-sniper replay <SESSION_ID>           # re-run recorded observations through the engine
 solana-sniper doctor                        # config, db, network, providers, credentials, quote test
 ```
@@ -268,7 +269,7 @@ Exit signals have a TTL and a cooldown; an ignored exit returns the position to 
 
 SQLite (WAL) tables: sessions, tokens, observations, trades, features, check_results, scores,
 signals, decisions, quotes, positions, fills, ledger, account_state, portfolio_snapshots,
-milestones, execution_records, state_transitions, errors. On startup the account is rebuilt from
+milestones, execution_records, state_transitions, errors, outcomes. On startup the account is rebuilt from
 `account_state` (or from the ledger if missing), open positions are re-registered, subscribed to
 market data and monitored again. `replay SESSION_ID` feeds the recorded stream into a fresh
 engine on a manual clock and writes to `<db>-replay.db`.
@@ -341,7 +342,47 @@ rendering validated with `plistlib`), plus `shellcheck` and `bash -n`. They have
 on a real macOS machine from this environment; `./doctor.sh` and `./status.sh` will show
 immediately if launchd or a provider is unhappy on your Mac.
 
-## 12. Quality gates
+## 12. Outcome measurement (`evaluate`)
+
+The engine cannot know which token will go up. What it can do is record, for every candidate it
+saw, what happened next, and let you check whether its scoring has any edge at all before you
+trust it with a single confirmation. That is what `OutcomeTracker` (`strategy/outcomes.py`) and
+`solana-sniper evaluate` (`strategy/evaluation.py`) do.
+
+* From the first priced snapshot of every candidate (rejected ones included, so there is no
+  survivorship bias) the tracker follows the market for `outcomes.horizon_s` (default 1 h) and
+  then writes one `outcomes` row: peak multiple and time to peak, worst drawdown after the peak,
+  final multiple, whether liquidity fell by more than `rug_liquidity_drop_pct` from its high,
+  the best score the engine gave it, and what the engine did (qualified, BUY signalled, entered,
+  closed PnL if the exit happened within the horizon). Data that goes silent for
+  `silence_timeout_s` finalises early (the pool died or the provider dropped it). At most
+  `max_followed` tokens are followed at once; the market watch is kept alive until measurement
+  ends, then released.
+* On shutdown, rows still in flight are persisted with `truncated: true`; `evaluate` excludes
+  them unless `--include-truncated` is given.
+* `evaluate` prints, per group (all followed, rejected, never qualified, qualified, signalled,
+  entered, and score buckets <40 / 40–59 / 60–74 / 75–89 / 90+): n, share that reached ≥2x, ≥5x,
+  ≥10x with 95% Wilson intervals, median peak, median end, median drawdown, liquidity-pull rate,
+  median closed PnL. Groups with n < 30 are dimmed because their rates are noise.
+
+Read the numbers with these caveats, which the command also prints:
+
+* Multiples are what a passive observer saw from the first snapshot. Nobody could have bought
+  at that price for that size; slippage, fees, failed fills and the round-trip haircut are not
+  included. A bucket "reaching 5x" is not a return.
+* Dry-run and synthetic rows are labelled `simulated` and say nothing about real Solana tokens.
+  Use `--session` to separate a live-data session from a synthetic one.
+* Past outcomes on a few hundred tokens are a weak, noisy signal about a market that changes
+  weekly. `evaluate` is there to falsify the scorer, not to tune it to the past. It never
+  feeds back into the engine automatically.
+
+```bash
+solana-sniper run --dry-run                 # collect live-data outcomes for a day or more
+solana-sniper evaluate                      # then look at what the scores were actually worth
+solana-sniper evaluate --session <ID> --min-observations 10
+```
+
+## 13. Quality gates
 
 ```bash
 pytest            # unit + integration (synthetic end-to-end, invariants, recovery)
@@ -349,7 +390,7 @@ ruff check .
 mypy              # --strict via pyproject
 ```
 
-## 13. Limitations (honest list)
+## 14. Limitations (honest list)
 
 * Live provider connectivity could **not** be exercised from the build sandbox (all external hosts
   were blocked by its egress policy). The adapters are written against the documented API shapes and
@@ -357,6 +398,11 @@ mypy              # --strict via pyproject
   Solana RPC + Jupiter + CoinGecko) is driven end to end in `tests/integration/test_live_pipeline_mocked.py`
   with the transports mocked. Real endpoints may still differ in detail; `solana-sniper doctor`
   will tell you within seconds which provider fails.
+* Outcome rows are observational. They cannot say what a trade would have made, only how
+  prices and liquidity moved after the engine saw a token; a position that closes after the
+  outcome horizon has no `closed_pnl_pct` on its row. The sample a single machine collects is
+  small and the market is non-stationary, so `evaluate` is a falsification tool, not a
+  strategy optimiser, and the engine never adjusts itself from it.
 * Holder counts require Helius; on public RPC the holder-count check is UNKNOWN (concentration from
   `getTokenLargestAccounts` still works).
 * DexScreener does not expose a "new pairs" endpoint; PumpPortal + GeckoTerminal are the

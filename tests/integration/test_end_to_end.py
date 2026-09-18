@@ -149,3 +149,50 @@ async def test_restart_recovery_resumes_open_position(tmp_path: Path) -> None:
     sessions = await repo.list_sessions()
     await repo.close()
     assert {s["session_id"] for s in sessions} >= {"recover-1", "recover-2"}
+
+
+async def test_forward_outcomes_are_measured_for_followed_candidates(harness: Harness) -> None:
+    """Every candidate with a price is followed for outcomes.horizon_s and lands in `outcomes`,
+    the market watch is released only once measurement is done, and shutdown persists what is
+    still in flight as truncated rows."""
+    engine = harness.engine
+    settings = harness.runtime.settings
+    tracker = engine.d.outcomes
+    assert tracker.enabled and settings.outcomes.horizon_s == 300
+    for _ in range(900):  # 450 simulated seconds > horizon
+        await harness.step(0.5)
+    assert tracker.finalized_count >= 1
+    await harness.runtime.repo.flush()
+    repo = harness.runtime.repo
+    rows = await repo.outcomes()
+    assert rows and len(rows) == tracker.finalized_count
+    assert all(r.simulated and not r.truncated for r in rows)
+    assert all(r.observations >= 2 and r.max_multiple >= 1.0 for r in rows)
+    assert all(0.0 <= r.max_drawdown_from_peak <= 1.0 for r in rows)
+    assert all(r.horizon_s == 300 and r.observed_window_s <= 300 + 60 for r in rows)
+    # the engine's decisions are recorded on the rows: entered ⊆ signalled ⊆ qualified
+    assert any(r.signalled for r in rows) or any(
+        tracker.is_following(m) for m in engine.positions_by_mint
+    )
+    for r in rows:
+        assert not r.entered or r.signalled
+        assert not r.signalled or r.qualified
+        assert r.best_score is None or 0 <= r.best_score <= 100
+    # measurement never changes what the engine did
+    assert engine.stats.signals >= 1
+    # watches are released only for finalised mints that are no longer candidates
+    finalised = {r.mint for r in rows}
+    assert len(finalised) == len(rows)  # one measurement window per token
+    gone = finalised - set(engine.candidates) - set(tracker.following())
+    assert gone and not (gone & set(harness.runtime.market.watched()))
+    still_followed = set(tracker.following())
+    assert still_followed <= set(harness.runtime.market.watched())
+    # shutdown: in-flight rows are persisted as truncated and never counted as complete
+    n_inflight = len(tracker)
+    persisted = await engine.finalize_outcomes()
+    assert persisted == n_inflight and len(tracker) == 0
+    rows2 = await repo.outcomes()
+    assert len(rows2) == len(rows) + persisted
+    assert sum(1 for r in rows2 if r.truncated) == persisted
+    health_counts = (await repo.counts())["outcomes"]
+    assert health_counts == len(rows2)

@@ -40,3 +40,7 @@ dry_run:
 dashboard:
   enabled: true
   refresh_hz: 4
+outcomes:
+  enabled: true
+  horizon_s: 300
+  silence_timeout_s: 120

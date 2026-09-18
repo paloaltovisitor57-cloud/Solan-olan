@@ -162,6 +162,8 @@ class HealthReporter:
                 "confirmed": stats.confirmed,
                 "cancelled": stats.cancelled,
                 "exits": stats.exits,
+                "outcomes_following": len(engine.d.outcomes),
+                "outcomes_finalized": engine.d.outcomes.finalized_count,
             },
             "portfolio": {
                 "equity_eur": str(q_display(acct_snap.equity_eur)),

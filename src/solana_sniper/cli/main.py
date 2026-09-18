@@ -259,7 +259,14 @@ def _print_paper_banner(paper: object, runtime: object) -> None:
     equity = runtime.account.equity
     console.print()
     console.print("[bold green]SOLANA SNIPER — PAPER[/]", highlight=False)
-    console.print("Mode:              PAPER / LIVE DATA", highlight=False)
+    synthetic = runtime.settings.is_synthetic or runtime.settings.quotes.source == "synthetic"
+    console.print(
+        f"Mode:              PAPER / {'SYNTHETIC' if synthetic else 'LIVE'} DATA", highlight=False
+    )
+    console.print(
+        f"Market data:       {'SYNTHETIC' if synthetic else 'LIVE'}   Execution: SIMULATED",
+        highlight=False,
+    )
     console.print("[bold red]Real transactions: DISABLED[/] (no keys, no signing, no broadcast)")
     console.print(f"Session:           {paper.session_id}", highlight=False)
     console.print(f"Database:          {safe_url(paper.database_url)}", highlight=False)
@@ -777,14 +784,164 @@ def portfolio(config: ConfigOpt = None) -> None:
 
 @app.command()
 def inspect(token: str, config: ConfigOpt = None) -> None:
-    """Everything recorded about a token mint."""
+    """Everything recorded about a token mint, starting with its entry attempts."""
 
     async def go() -> None:
         repo, _ = _open_repo(config)
         await repo.init()
         history = await repo.token_history(token)
+        attempts = await repo.entry_attempts(mint=token)
         await repo.close()
+        if attempts:
+            console.print(f"[bold]entry attempts for {token}[/]")
+            for a in attempts:
+                for line in _attempt_lines(a):
+                    console.print(line, highlight=False)
+                console.print()
+        else:
+            console.print("[dim]no entry attempts recorded (the token never qualified)[/]")
         console.print_json(json.dumps(history, default=str))
+
+    asyncio.run(go())
+
+
+def _attempt_lines(a: object) -> list[str]:
+    from solana_sniper.domain.models import EntryAttempt
+
+    assert isinstance(a, EntryAttempt)
+    decision = str(a.final_decision)
+    color = {
+        "BUY_SIGNAL": "green",
+        "PENDING": "yellow",
+        "EXPIRED": "yellow",
+        "ABANDONED": "red",
+        "HARD_REJECT": "red",
+        "QUOTE_FAILED": "red",
+        "SIZING_ZERO": "red",
+        "STALE": "red",
+        "CANCELLED": "dim",
+    }.get(decision, "")
+    quote = a.buy_quote_status
+    if a.quote_attempts:
+        quote = (
+            f"buy {a.buy_quote_status} / sell {a.sell_quote_status} "
+            f"({a.quote_attempts} attempt{'s' if a.quote_attempts != 1 else ''})"
+        )
+    rt = (
+        f"{a.round_trip_loss_pct:.1%} estimated loss"
+        f"{'' if a.round_trip_viable else ' (not viable)'}"
+        if a.round_trip_loss_pct is not None
+        else "n/a"
+    )
+    sizing = (
+        f"€{a.recommended_eur:.2f} ({a.recommended_sol:.4f} SOL)"
+        if a.recommended_eur is not None and a.recommended_sol is not None
+        else ("not reached" if not a.sizing_attempted else "n/a")
+    ) + (f"  caps: {a.sizing_reason}" if a.sizing_reason else "")
+    post = f"{a.post_quote_score:.1f}" if a.post_quote_score is not None else "n/a"
+    band = (
+        f"{a.min_score_seen:.1f}-{a.max_score_seen:.1f} over {a.evaluations} evaluations"
+        if a.min_score_seen is not None and a.max_score_seen is not None
+        else "n/a"
+    )
+    verdict = f"[{color}]{decision}[/]" if color else decision
+    if a.hysteresis_holds and decision == "BUY_SIGNAL":
+        verdict += " (continued within hysteresis)"
+    lines = [
+        f"{a.symbol or a.mint[:8]}  attempt #{a.attempt_number}  {a.attempt_id}",
+        f"  QUALIFIED {a.qualified_at:%H:%M:%S}  score {a.qualified_score:.1f}  "
+        f"latch until {a.latch_until:%H:%M:%S}",
+        f"  decimals: {a.decimals_status}",
+        f"  sizing: {sizing}",
+        f"  quote: {quote}"
+        + (f"  error: {a.quote_error}" if a.quote_error else "")
+        + (
+            f"  impact buy {a.entry_price_impact_pct:.1f}%"
+            if a.entry_price_impact_pct is not None
+            else ""
+        )
+        + (
+            f" / sell {a.exit_price_impact_pct:.1f}%" if a.exit_price_impact_pct is not None else ""
+        ),
+        f"  round trip: {rt}",
+        f"  post quote score: {post}   score band: {band}   hysteresis holds: {a.hysteresis_holds}",
+        f"  decision: {verdict}",
+        f"  reason: {a.block_reason or '-'}",
+    ]
+    if a.completed_at is not None:
+        lines.append(f"  completed {a.completed_at:%H:%M:%S}")
+    return lines
+
+
+@app.command("entry-attempts")
+def entry_attempts(
+    config: ConfigOpt = None,
+    session: Annotated[
+        str | None, typer.Option("--session", help="Restrict to one recorded session id")
+    ] = None,
+    mint: Annotated[str | None, typer.Option("--mint", help="Restrict to one mint")] = None,
+    limit: Annotated[int, typer.Option("--limit", help="Most recent N attempts")] = 100,
+    verbose: Annotated[
+        bool, typer.Option("--verbose", "-v", help="Full per-attempt detail instead of a table")
+    ] = False,
+) -> None:
+    """Why each qualified token did or did not become a BUY signal (one row per latch window)."""
+
+    async def go() -> None:
+        repo, settings = _open_repo(config)
+        await repo.init()
+        rows = await repo.entry_attempts(session_id=session, mint=mint, limit=100_000)
+        await repo.close()
+        console.print(_context_line(settings))
+        rows = rows[-limit:]
+        if not rows:
+            console.print("no entry attempts recorded: no candidate reached QUALIFIED yet")
+            return
+        if verbose:
+            for a in rows:
+                for line in _attempt_lines(a):
+                    console.print(line, highlight=False)
+                console.print()
+        else:
+            table = Table(title=f"entry attempts ({len(rows)})")
+            for col in (
+                "qualified",
+                "symbol",
+                "mint",
+                "score",
+                "decimals",
+                "sizing",
+                "quote",
+                "rt loss",
+                "post",
+                "decision",
+                "reason",
+            ):
+                table.add_column(col, overflow="fold")
+            for a in rows:
+                table.add_row(
+                    f"{a.qualified_at:%m-%d %H:%M:%S}",
+                    a.symbol or "?",
+                    f"{a.mint[:6]}…{a.mint[-4:]}",
+                    f"{a.qualified_score:.1f}",
+                    a.decimals_status,
+                    f"€{a.recommended_eur:.2f}" if a.recommended_eur is not None else "-",
+                    f"{a.buy_quote_status}/{a.sell_quote_status}"
+                    if a.quote_attempts
+                    else "not attempted",
+                    f"{a.round_trip_loss_pct:.1%}" if a.round_trip_loss_pct is not None else "-",
+                    f"{a.post_quote_score:.1f}" if a.post_quote_score is not None else "-",
+                    str(a.final_decision),
+                    (a.block_reason or "-")[:90],
+                )
+            console.print(table)
+        by_decision: dict[str, int] = {}
+        for a in rows:
+            by_decision[str(a.final_decision)] = by_decision.get(str(a.final_decision), 0) + 1
+        console.print("decisions: " + ", ".join(f"{k}={v}" for k, v in sorted(by_decision.items())))
+        console.print(
+            "[dim]-v shows the full trail; `inspect <MINT>` shows one token's attempts and history[/]"
+        )
 
     asyncio.run(go())
 
@@ -908,7 +1065,10 @@ def evaluate(
         console.print(
             f"excluded: {report.excluded_truncated} truncated at shutdown, "
             f"{report.excluded_short} with < {min_observations} observations. "
-            f"Rows: {report.simulated_rows} simulated/dry-run, {report.live_rows} live-data."
+            f"Market data: {report.live_market_rows} live Solana, {report.synthetic_rows} "
+            f"synthetic, {report.legacy_rows} legacy (unknown). "
+            f"Execution: {report.simulated_rows} simulated (paper/dry-run), "
+            f"{report.live_rows} manual-signal."
         )
         console.print(
             f"[bold]Read this carefully:[/bold] groups with n < {MIN_MEANINGFUL_N} are dimmed "
@@ -916,14 +1076,21 @@ def evaluate(
             "Multiples are what a passive observer saw from the first snapshot, not what a "
             "buyer would have realised. Past outcomes do not predict future ones."
         )
-        if report.all_simulated:
+        if report.all_synthetic:
             console.print(
-                "[yellow]Every row here is from a simulated or synthetic run. It says nothing "
-                "about real Solana tokens.[/yellow]"
+                "[yellow]Every row here is from the synthetic world. It says nothing about real "
+                "Solana tokens.[/yellow]"
             )
         elif report.mixed_provenance:
             console.print(
-                "[yellow]Simulated and live rows are mixed; use --session to separate them.[/yellow]"
+                "[yellow]Live, synthetic and/or legacy rows are mixed; use --session to "
+                "separate them.[/yellow]"
+            )
+        if report.live_market_rows and report.simulated_rows:
+            console.print(
+                "[bold]These are live Solana market observations with simulated execution "
+                "(paper). The multiples are passive price paths, not executable returns: "
+                "slippage, fill risk and liquidity pulls are not in them.[/bold]"
             )
 
     asyncio.run(go())

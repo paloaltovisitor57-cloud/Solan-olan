@@ -112,6 +112,43 @@ async def _v3_repair_legacy_simulated(conn: AsyncConnection) -> None:
                 )
 
 
+async def _v4_outcome_provenance(conn: AsyncConnection) -> None:
+    """Split the single `simulated` flag into market-data and execution provenance. Rows written
+    before this migration cannot tell live market data from the synthetic world, so their market
+    provenance is UNKNOWN_LEGACY; their execution provenance follows the old flag."""
+    await conn.run_sync(Base.metadata.create_all)
+    cols = {row[1] for row in (await conn.execute(text("PRAGMA table_info(outcomes)"))).all()}
+    if "market_provenance" not in cols:
+        await conn.execute(text("ALTER TABLE outcomes ADD COLUMN market_provenance VARCHAR(16)"))
+    if "execution_provenance" not in cols:
+        await conn.execute(text("ALTER TABLE outcomes ADD COLUMN execution_provenance VARCHAR(16)"))
+    await conn.execute(
+        text(
+            "UPDATE outcomes SET market_provenance = 'UNKNOWN_LEGACY' "
+            "WHERE market_provenance IS NULL"
+        )
+    )
+    await conn.execute(
+        text(
+            "UPDATE outcomes SET execution_provenance = CASE WHEN simulated THEN 'SIMULATED' "
+            "ELSE 'MANUAL_SIGNAL' END WHERE execution_provenance IS NULL"
+        )
+    )
+    rows = (await conn.execute(text("SELECT id, payload FROM outcomes"))).all()
+    for row_id, raw in rows:
+        payload = json.loads(raw) if isinstance(raw, str) else dict(raw or {})
+        if "market_data" in payload and "execution" in payload:
+            continue
+        payload.setdefault("market_data", "UNKNOWN_LEGACY")
+        payload.setdefault(
+            "execution", "SIMULATED" if payload.get("simulated") else "MANUAL_SIGNAL"
+        )
+        await conn.execute(
+            text("UPDATE outcomes SET payload = :payload WHERE id = :id"),
+            {"payload": json.dumps(payload), "id": row_id},
+        )
+
+
 MIGRATIONS: list[tuple[int, str, Step]] = [
     (1, "initial schema", _v1_initial),
     (
@@ -123,6 +160,11 @@ MIGRATIONS: list[tuple[int, str, Step]] = [
         3,
         "repair legacy simulated records (UNKNOWN_LEGACY + simulated -> SIMULATED)",
         _v3_repair_legacy_simulated,
+    ),
+    (
+        4,
+        "outcome provenance: market data (LIVE/SYNTHETIC) separate from execution (SIMULATED)",
+        _v4_outcome_provenance,
     ),
 ]
 

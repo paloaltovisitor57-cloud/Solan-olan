@@ -274,6 +274,24 @@ class ErrorRow(Base):
     detail: Mapped[str] = mapped_column(Text, default="")
 
 
+class EntryAttemptRow(Base):
+    """One qualification latch window (see domain.models.EntryAttempt). Audit trail for
+    'this token qualified but no BUY signal was generated because ...'."""
+
+    __tablename__ = "entry_attempts"
+    attempt_id: Mapped[str] = mapped_column(String(40), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(64), index=True)
+    mint: Mapped[str] = mapped_column(String(64), index=True)
+    symbol: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    qualified_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    qualified_score: Mapped[float] = mapped_column(Float)
+    post_quote_score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_decision: Mapped[str] = mapped_column(String(24), index=True)
+    block_reason: Mapped[str | None] = mapped_column(String(300), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON)
+
+
 class OutcomeRow(Base):
     """Forward outcome of an observed token (see strategy/outcomes.py). Measurement only."""
 
@@ -302,4 +320,8 @@ class OutcomeRow(Base):
     reject_reason: Mapped[str | None] = mapped_column(String(160), nullable=True)
     simulated: Mapped[bool] = mapped_column(Boolean)
     truncated: Mapped[bool] = mapped_column(Boolean, default=False)
+    # nullable: databases migrated from v3 gain these columns via ALTER TABLE, which cannot add
+    # NOT NULL columns; v4 backfills them and new rows always set them
+    market_provenance: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    execution_provenance: Mapped[str | None] = mapped_column(String(16), nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON)

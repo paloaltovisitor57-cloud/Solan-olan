@@ -165,7 +165,7 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
     tmp_path: Path, clock: ManualClock
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path}/legacy.db"
-    assert await run_migrations(url) == [1, 2, 3]
+    assert await run_migrations(url) == [1, 2, 3, 4]
     engine = create_async_engine(url)
     now = datetime.now(tz=UTC).isoformat()
     legacy_fill = {
@@ -235,8 +235,8 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
             {"t": _db_now()},
         )
     await engine.dispose()
-    assert await run_migrations(url) == [2, 3]
-    assert await schema_version(url) == 3
+    assert await run_migrations(url) == [2, 3, 4]
+    assert await schema_version(url) == 4
     engine = create_async_engine(url)
     async with engine.begin() as conn:
         fill_payload = json.loads(

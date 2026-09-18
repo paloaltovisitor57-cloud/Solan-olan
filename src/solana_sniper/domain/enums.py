@@ -154,6 +154,35 @@ class Venue(StrEnum):
     UNKNOWN = "unknown"
 
 
+class MarketDataProvenance(StrEnum):
+    """Where the observed prices/liquidity came from."""
+
+    LIVE = "LIVE"  # real Solana discovery and market data
+    SYNTHETIC = "SYNTHETIC"  # the offline synthetic world
+    UNKNOWN_LEGACY = "UNKNOWN_LEGACY"  # recorded before the distinction existed
+
+
+class ExecutionProvenance(StrEnum):
+    """How fills were produced (never on-chain in this software)."""
+
+    SIMULATED = "SIMULATED"  # paper/dry-run: simulated confirmations and fills
+    MANUAL_SIGNAL = "MANUAL_SIGNAL"  # live signal mode: a human confirms every fill
+
+
+class EntryDecision(StrEnum):
+    """How an entry attempt (one qualification latch window) ended."""
+
+    PENDING = "PENDING"  # still latched
+    BUY_SIGNAL = "BUY_SIGNAL"  # a BUY signal was generated
+    ABANDONED = "ABANDONED"  # strategy/economics no longer acceptable (score collapse, round trip)
+    EXPIRED = "EXPIRED"  # the latch window ended without a signal (quote/decimals/sizing pending)
+    HARD_REJECT = "HARD_REJECT"  # fatal safety check while latched
+    QUOTE_FAILED = "QUOTE_FAILED"  # no usable quote after the bounded retries
+    SIZING_ZERO = "SIZING_ZERO"  # risk engine sized the position to zero
+    STALE = "STALE"  # market data became unusable
+    CANCELLED = "CANCELLED"  # engine stopped or candidate retired while latched
+
+
 class RunMode(StrEnum):
     LIVE = "LIVE"
     DRY_RUN = "DRY_RUN"

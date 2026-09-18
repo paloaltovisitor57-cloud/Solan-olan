@@ -24,6 +24,7 @@ from solana_sniper.domain.enums import (
     CandidateState,
     DecisionKind,
     DecisionSource,
+    EntryDecision,
     RunMode,
     SignalKind,
     SignalStatus,
@@ -57,6 +58,7 @@ from solana_sniper.domain.events import (
 from solana_sniper.domain.models import (
     BuySignal,
     CheckReport,
+    EntryAttempt,
     EntryScore,
     ErrorRecord,
     FeatureVector,
@@ -134,6 +136,10 @@ class Candidate:
     exit_quote_in_flight: bool = False
     sell_order: PendingOrder | None = None
     last_reason: str = ""
+    entry: EntryAttempt | None = None  # open qualification latch window (audit record)
+    entry_attempts: int = 0
+    metadata_attempts: int = 0
+    metadata_next_at: datetime | None = None
 
     @property
     def mint(self) -> str:
@@ -428,13 +434,24 @@ class Engine:
             self._retire(cand, S.EXPIRED, f"token age {age:.0f}s exceeds max")
             return
         if cand.track.is_stale(now, cfg.market_data.stale_after_s):
+            data_age = cand.track.data_age_s(now)
+            if (
+                cand.state is S.QUALIFIED
+                and cand.quote_in_flight
+                and data_age <= cfg.market_data.stale_after_s + cfg.entry.stale_grace_during_quote_s
+            ):
+                return  # bounded grace: let the in-flight quote finish; no signal on stale data
             if cand.state in (S.MONITORING, S.QUALIFIED):
                 cand.stale_since = now
                 self.d.metrics.inc("stale_suppressions")
+                if cand.entry is not None:
+                    self._close_attempt(cand, EntryDecision.STALE, f"no data for {data_age:.0f}s")
                 self._transition(
-                    cand, S.DATA_STALE, f"no data for {cand.track.data_age_s(now):.0f}s"
+                    cand, S.DATA_STALE, f"no data for {data_age:.0f}s{self._provider_note()}"
                 )
             return
+        if cand.state in (S.MONITORING, S.QUALIFIED):
+            self._request_metadata(cand, urgent=cand.state is S.QUALIFIED)
 
         features = self.d.features.compute(
             cand.track,
@@ -460,21 +477,139 @@ class Engine:
             return
         if cand.cooldown_until and now < cand.cooldown_until:
             return
-        if decision.qualified:
-            if cand.state is S.MONITORING:
-                self.stats.qualified += 1
-                self.d.metrics.inc("tokens_qualified")
-                self._transition(cand, S.QUALIFIED, f"score {score.score:.0f}")
-                self.timer.mark(cand.mint, "qualified")
-                latest = cand.track.latest
-                self.d.outcomes.note_qualified(
-                    cand.mint, latest.price_native if latest else None, now
-                )
-                self._refresh_holders(cand, now)
-            if cand.state is S.QUALIFIED:
-                await self._maybe_signal(cand, features, now)
+        if cand.state is S.MONITORING and decision.qualified:
+            self._qualify(cand, score, features, checks, now)
         elif cand.state is S.QUALIFIED:
-            self._transition(cand, S.MONITORING, "; ".join(decision.reasons)[:120])
+            if cand.entry is not None:
+                cand.entry.note_score(score.score)
+            verdict, why = self.d.gate.latched(features, checks, score)
+            if verdict == "fatal":
+                self._retire(cand, S.REJECTED, why[:200])
+                return
+            if verdict == "abandon":
+                self._abandon(cand, EntryDecision.ABANDONED, why, now)
+                return
+            if not decision.qualified and cand.entry is not None:
+                cand.entry.hysteresis_holds += 1
+            if cand.entry is not None and now >= cand.entry.latch_until:
+                pending = (
+                    cand.entry.block_reason
+                    or "; ".join(decision.soft_reasons)
+                    or (
+                        "quote still in flight"
+                        if cand.quote_in_flight
+                        else "no signal within latch"
+                    )
+                )
+                if decision.qualified and cand.entry_attempts < cfg.entry.max_entry_attempts:
+                    # still fully qualified: one more bounded window, recorded separately
+                    self._close_attempt(cand, EntryDecision.EXPIRED, f"latch expired: {pending}")
+                    self._open_attempt(cand, score, features, checks, now)
+                else:
+                    self._abandon(
+                        cand,
+                        EntryDecision.EXPIRED,
+                        f"latch expired: {pending}"
+                        if decision.qualified is False
+                        else f"entry attempts exhausted ({cand.entry_attempts}): {pending}",
+                        now,
+                    )
+                    return
+        if cand.state is S.QUALIFIED:
+            await self._maybe_signal(cand, features, now)
+
+    # ---------------------------------------------------- qualification latch
+    def _qualify(
+        self,
+        cand: Candidate,
+        score: EntryScore,
+        features: FeatureVector,
+        checks: CheckReport,
+        now: datetime,
+    ) -> None:
+        self.stats.qualified += 1
+        self.d.metrics.inc("tokens_qualified")
+        self._transition(cand, S.QUALIFIED, f"score {score.score:.0f}")
+        self.timer.mark(cand.mint, "qualified")
+        latest = cand.track.latest
+        self.d.outcomes.note_qualified(cand.mint, latest.price_native if latest else None, now)
+        self._refresh_holders(cand, now)
+        self._open_attempt(cand, score, features, checks, now)
+
+    def _open_attempt(
+        self,
+        cand: Candidate,
+        score: EntryScore,
+        features: FeatureVector,
+        checks: CheckReport,
+        now: datetime,
+    ) -> None:
+        cand.entry_attempts += 1
+        decimals = self._token_decimals(cand)
+        attempt = EntryAttempt(
+            attempt_id=new_id("entry"),
+            session_id=self.session_id,
+            mint=cand.mint,
+            symbol=cand.symbol,
+            qualified_at=now,
+            qualified_score=score.score,
+            latch_until=now + timedelta(seconds=self.settings.entry.qualification_latch_s),
+            qualified_features=features.as_dict(),
+            qualified_checks=checks.summary(),
+            attempt_number=cand.entry_attempts,
+            decimals_status=f"known:{decimals}" if decimals is not None else "unknown",
+            min_score_seen=score.score,
+            max_score_seen=score.score,
+            evaluations=1,
+        )
+        cand.entry = attempt
+        self.d.metrics.inc("entry_attempts")
+        self.d.repo.save_entry_attempt(attempt)
+        if decimals is None:
+            self._request_metadata(cand, urgent=True)
+
+    def _close_attempt(self, cand: Candidate, decision: EntryDecision, reason: str) -> None:
+        attempt = cand.entry
+        if attempt is None or not attempt.is_open:
+            cand.entry = None
+            return
+        attempt.final_decision = decision
+        attempt.block_reason = reason[:300] if reason else None
+        attempt.completed_at = self.now()
+        self.d.repo.save_entry_attempt(attempt)
+        self.d.metrics.inc(f"entry_{decision.lower()}")
+        self._log_event(
+            f"entry {decision.lower()} {cand.symbol or cand.mint[:8]}: {reason}"[:220],
+            "DEBUG" if decision is EntryDecision.BUY_SIGNAL else "INFO",
+        )
+        cand.entry = None
+
+    def _abandon(
+        self, cand: Candidate, decision: EntryDecision, reason: str, now: datetime
+    ) -> None:
+        """End the latch without a signal: MONITORING with a quote cooldown so a re-qualification
+        needs fresh evidence rather than the next tick."""
+        self._close_attempt(cand, decision, reason)
+        cand.next_quote_at = now + timedelta(seconds=self.settings.quotes.refresh_interval_s)
+        cand.cooldown_until = now + timedelta(seconds=self.settings.entry.cooldown_after_abandon_s)
+        if cand.state is S.QUALIFIED:
+            self._transition(cand, S.MONITORING, f"{decision.lower()}: {reason}"[:120])
+
+    async def finalize_entry_attempts(self) -> int:
+        """Shutdown: every open latch window gets a terminal CANCELLED record."""
+        closed = 0
+        for cand in list(self.candidates.values()):
+            if cand.entry is not None and cand.entry.is_open:
+                self._close_attempt(cand, EntryDecision.CANCELLED, "engine stopped")
+                closed += 1
+        if closed:
+            await self.d.repo.flush()
+        return closed
+
+    def _provider_note(self) -> str:
+        note = getattr(self.d.market, "provider_note", None)
+        result = note() if callable(note) else ""
+        return str(result)
 
     def _token_decimals(self, cand: Candidate) -> int | None:
         """Decimals from discovery metadata or the mint account; None until known, never guessed."""
@@ -490,6 +625,12 @@ class Engine:
     def _retire(self, cand: Candidate, state: CandidateState, reason: str) -> None:
         if cand.sm.is_terminal:
             return
+        if cand.entry is not None:
+            self._close_attempt(
+                cand,
+                EntryDecision.HARD_REJECT if state is S.REJECTED else EntryDecision.CANCELLED,
+                reason,
+            )
         if state is S.REJECTED:
             self.stats.rejected += 1
             self.d.metrics.inc("tokens_rejected")
@@ -498,10 +639,22 @@ class Engine:
             self._log_event(f"{state.lower()} {cand.symbol or cand.mint[:8]}: {reason}", "DEBUG")
             self.d.repo.save_token_state(cand.mint, str(state))
 
-    def _request_metadata(self, cand: Candidate) -> None:
-        if cand.metadata_requested or self.d.metadata is None:
+    def _request_metadata(self, cand: Candidate, *, urgent: bool = False) -> None:
+        """Fetch mint authorities/decimals. A rate-limited or failed fetch is retried with a
+        bounded backoff while the candidate lives (the first live run showed one degraded fetch
+        left decimals unknown forever, so no quote was ever requested)."""
+        if self.d.metadata is None or cand.track.authorities is not None:
             return
+        now = self.now()
+        if cand.metadata_requested:
+            if cand.metadata_attempts >= self.settings.entry.metadata_max_attempts:
+                return
+            if cand.metadata_next_at is not None and now < cand.metadata_next_at:
+                return
         cand.metadata_requested = True
+        cand.metadata_attempts += 1
+        delay = self.settings.entry.metadata_retry_s * (1 if urgent else cand.metadata_attempts)
+        cand.metadata_next_at = now + timedelta(seconds=min(60.0, delay))
         self._spawn(self._fetch_metadata(cand), f"meta-{cand.mint[:6]}")
 
     async def _fetch_metadata(self, cand: Candidate) -> None:
@@ -520,6 +673,8 @@ class Engine:
         if auth is not None:
             cand.track.authorities = auth
             cand.dirty = True
+            if cand.entry is not None and cand.entry.decimals_status == "unknown":
+                cand.entry.decimals_status = f"resolved:{auth.decimals}"
         self._refresh_holders(cand, self.now(), force=True)
 
     def _enrichment_degraded(self, what: str, cand: Candidate, exc: Exception) -> None:
@@ -578,18 +733,35 @@ class Engine:
         if len(self.d.execution.pending()) >= self.settings.entry.max_pending_signals:
             cand.gate_reasons = ("max pending signals reached",)
             return
+        attempt = cand.entry
         if self._token_decimals(cand) is None:
             cand.gate_reasons = ("token decimals unknown (waiting for mint metadata)",)
-            cand.next_quote_at = now + timedelta(seconds=2)
+            if attempt is not None and attempt.block_reason is None:
+                attempt.decimals_status = "unknown"
+                attempt.block_reason = "token decimals unknown (mint metadata not fetched yet)"
+                self.d.repo.save_entry_attempt(attempt)  # the trail says what is blocking now
+            self._request_metadata(cand, urgent=True)
+            cand.next_quote_at = now + timedelta(seconds=1)
             return
         sizing = self._size(cand, features)
+        if attempt is not None:
+            attempt.sizing_attempted = True
+            attempt.recommended_eur = sizing.recommended_eur
+            attempt.recommended_sol = sizing.recommended_sol
+            attempt.sizing_reason = "; ".join(sizing.caps_applied) or None
+            if attempt.decimals_status == "unknown":
+                attempt.decimals_status = f"resolved:{self._token_decimals(cand)}"
         if sizing.recommended_eur <= 0:
-            cand.gate_reasons = tuple(f"sizing: {c}" for c in sizing.caps_applied) or (
-                "sizing: zero",
-            )
-            cand.next_quote_at = now + timedelta(seconds=5)
+            reason = "sizing: " + ("; ".join(sizing.caps_applied) or "zero")
+            cand.gate_reasons = (reason,)
+            self._abandon(cand, EntryDecision.SIZING_ZERO, reason, now)
             return
         cand.quote_in_flight = True
+        if attempt is not None:
+            attempt.quote_attempts += 1
+            attempt.quote_started_at = attempt.quote_started_at or now
+            attempt.block_reason = None
+            self.d.repo.save_entry_attempt(attempt)
         self._spawn(
             self._quote_and_signal(cand, sizing.recommended_sol, sizing.recommended_eur),
             f"quote-{cand.mint[:6]}",
@@ -639,6 +811,7 @@ class Engine:
         self, cand: Candidate, spend_sol: Decimal, size_eur: Decimal
     ) -> None:
         cfg = self.settings
+        attempt = cand.entry
         decimals = self._token_decimals(cand)
         if decimals is None:
             cand.gate_reasons = ("token decimals unknown (waiting for mint metadata)",)
@@ -648,14 +821,20 @@ class Engine:
         except QuoteError as exc:
             cand.quote_attempts += 1
             self.d.metrics.inc("quote_failures")
+            if attempt is not None:
+                attempt.quote_finished_at = self.now()
+                attempt.buy_quote_status = "failed"
+                attempt.quote_error = safe_exception(exc)[:200]
             if exc.retryable and cand.quote_attempts < 3:
                 cand.next_quote_at = self.now() + timedelta(seconds=3)
                 cand.gate_reasons = (f"quote retry: {exc}",)
+                if attempt is not None:
+                    attempt.block_reason = f"quote retry {cand.quote_attempts}: {exc}"[:300]
+                    self.d.repo.save_entry_attempt(attempt)
                 return
             cand.cooldown_until = self.now() + timedelta(seconds=cfg.entry.cooldown_after_cancel_s)
             cand.gate_reasons = (f"quote failed: {exc}",)
-            if cand.state is S.QUALIFIED:
-                self._transition(cand, S.MONITORING, f"quote failed: {exc}"[:120])
+            self._abandon(cand, EntryDecision.QUOTE_FAILED, f"quote failed: {exc}", self.now())
             return
         now = self.now()
         cand.quote_attempts = 0
@@ -665,6 +844,19 @@ class Engine:
         if rt.sell is not None:
             self.d.bus.publish(QuoteObtained(rt.sell))
         self.d.bus.publish(RoundTripEvaluated(rt))
+        if attempt is not None:
+            attempt.quote_finished_at = now
+            attempt.buy_quote_status = "ok"
+            attempt.sell_quote_status = "ok" if rt.sell is not None else "failed"
+            attempt.quote_ids = [*attempt.quote_ids, rt.buy.quote_id]
+            if rt.sell is not None:
+                attempt.quote_ids.append(rt.sell.quote_id)
+            attempt.entry_price_impact_pct = rt.entry_price_impact_pct
+            attempt.exit_price_impact_pct = rt.exit_price_impact_pct
+            attempt.round_trip_loss_pct = rt.round_trip_loss_pct
+            attempt.round_trip_viable = rt.viable
+            if rt.sell is None:
+                attempt.quote_error = "; ".join(rt.reasons)[:200]
         # If price impact is too high, shrink once and re-quote.
         if (
             rt.buy.price_impact_pct > cfg.risk.hard_limits.max_entry_price_impact_pct
@@ -686,6 +878,22 @@ class Engine:
                     cand, shrunk, q_eur(shrunk * self.d.fx.sol_eur())
                 )
         if cand.state is not S.QUALIFIED:
+            return  # the evaluator ended the attempt while the quote was in flight
+        # Post-quote validation for an already-qualified candidate: execution viability, data
+        # freshness and hard blocks end the attempt; a score wobble inside the hysteresis band
+        # does not (the quote is what makes the decision executable).
+        if not rt.viable:
+            self._abandon(
+                cand, EntryDecision.ABANDONED, "round trip: " + "; ".join(rt.reasons), now
+            )
+            return
+        if cand.track.is_stale(now, cfg.market_data.stale_after_s):
+            self._abandon(
+                cand,
+                EntryDecision.STALE,
+                f"data {cand.track.data_age_s(now):.0f}s old after quote",
+                now,
+            )
             return
         features = self.d.features.compute(
             cand.track,
@@ -699,18 +907,30 @@ class Engine:
         self.d.bus.publish(ChecksEvaluated(checks))
         self.d.bus.publish(Scored(score))
         self.d.outcomes.note_score(cand.mint, score.score)
+        if attempt is not None:
+            attempt.post_quote_score = score.score
+            attempt.note_score(score.score)
         decision = self.d.gate.decide(features, checks, score)
         cand.gate_reasons = decision.reasons
-        if decision.fatal:
-            self._retire(cand, S.REJECTED, "; ".join(decision.reasons)[:200])
+        verdict, why = self.d.gate.latched(features, checks, score)
+        if verdict == "fatal":
+            self._retire(cand, S.REJECTED, why[:200])
             return
-        if not decision.qualified:
-            cand.next_quote_at = now + timedelta(seconds=cfg.quotes.refresh_interval_s)
-            self._transition(cand, S.MONITORING, "; ".join(decision.reasons)[:120])
+        if verdict == "abandon":
+            self._abandon(cand, EntryDecision.ABANDONED, why, now)
             return
+        if not decision.qualified and attempt is not None:
+            attempt.hysteresis_holds += 1
+            self._log_event(
+                f"{cand.symbol or cand.mint[:8]}: post-quote score {score.score:.1f} under "
+                f"{cfg.entry.min_score:.0f}, continuing within hysteresis",
+                "DEBUG",
+            )
         sizing = self._size(cand, features)
         if sizing.recommended_eur <= 0:
-            cand.gate_reasons = tuple(f"sizing: {c}" for c in sizing.caps_applied)
+            reason = "sizing: " + ("; ".join(sizing.caps_applied) or "zero")
+            cand.gate_reasons = (reason,)
+            self._abandon(cand, EntryDecision.SIZING_ZERO, reason, now)
             return
         # Never spend more than the sized amount (a re-quote may have shrunk it).
         if sizing.recommended_sol < rt.spend_sol * Decimal("0.98"):
@@ -776,6 +996,9 @@ class Engine:
         self.stats.last_signal_at = now
         self.d.metrics.inc("signals_generated")
         self.d.outcomes.note_signal(cand.mint)
+        if attempt is not None:
+            attempt.signal_id = signal.signal_id
+            self._close_attempt(cand, EntryDecision.BUY_SIGNAL, f"BUY signal #{order.ref}")
         self.timer.mark(cand.mint, "signal")
         self.d.repo.save_signal(signal, str(SignalStatus.PENDING))
         self.d.bus.publish(BuySignalCreated(signal))

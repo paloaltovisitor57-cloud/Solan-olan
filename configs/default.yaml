@@ -17,6 +17,7 @@ market_data:
   trade_window_s: 300
   buffer_seconds: 900
   max_concurrent_requests: 6
+  priority_poll_interval_s: 0.75            # latched/qualified/open mints refreshed on this cadence
 
 filters:
   max_token_age_s: 1800
@@ -44,6 +45,22 @@ filters:
 
 entry:
   min_score: 65
+  # Qualification lifecycle (README "Entry lifecycle"). A candidate qualifies at min_score and
+  # stays latched for qualification_latch_s while decimals, sizing and the round-trip quote are
+  # obtained; it is demoted only below min_score - qualification_hysteresis, on a hard block
+  # (stale data, failed checks, sizing zero, bad round-trip economics), on a fatal safety check,
+  # or when the latch expires without a signal. Never a one-tick edge trigger again.
+  qualification_hysteresis: 8
+  qualification_latch_s: 8
+  max_entry_attempts: 6
+  cooldown_after_abandon_s: 30
+  severe_momentum_60s: -0.15
+  stale_grace_during_quote_s: 5
+  metadata_retry_s: 5
+  metadata_max_attempts: 8
+  # acceleration = mean of N raw (10 s return - previous 10 s return) samples spaced apart
+  acceleration_smoothing_samples: 4
+  acceleration_sample_spacing_s: 2.5
   min_observations: 4
   min_momentum_30s: 0.0
   min_momentum_60s: -0.05

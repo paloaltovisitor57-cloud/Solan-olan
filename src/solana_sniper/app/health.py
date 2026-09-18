@@ -143,6 +143,8 @@ class HealthReporter:
             "previous_exit": rt.boot.previous_exit if rt.boot else None,
             "hostname": socket.gethostname(),
             "mode": str(engine.mode),
+            "market_data_provenance": str(engine.d.outcomes.market_data),
+            "execution_provenance": str(engine.d.outcomes.execution),
             "session_id": engine.session_id,
             "started_at": engine.started_at.isoformat() if engine.started_at else None,
             "uptime_s": _age(now, engine.started_at),

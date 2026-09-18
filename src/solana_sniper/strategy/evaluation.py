@@ -74,17 +74,25 @@ class EvaluationReport:
     used_rows: int
     excluded_truncated: int
     excluded_short: int
-    simulated_rows: int
-    live_rows: int
+    simulated_rows: int  # execution simulated (paper/dry-run), whatever the market data
+    live_rows: int  # execution by manual signal (live signal mode)
     horizon_s: float | None
     buckets: list[BucketStats] = field(default_factory=list)
+    live_market_rows: int = 0  # real Solana market data (paper sessions included)
+    synthetic_rows: int = 0  # the synthetic world
+    legacy_rows: int = 0  # recorded before market provenance existed
 
     @property
     def mixed_provenance(self) -> bool:
-        return self.simulated_rows > 0 and self.live_rows > 0
+        kinds = sum(1 for n in (self.live_market_rows, self.synthetic_rows, self.legacy_rows) if n)
+        return kinds > 1
 
     @property
-    def all_simulated(self) -> bool:
+    def all_synthetic(self) -> bool:
+        return self.used_rows > 0 and self.synthetic_rows == self.used_rows
+
+    @property
+    def all_simulated(self) -> bool:  # kept for older callers: execution simulated everywhere
         return self.used_rows > 0 and self.live_rows == 0
 
 
@@ -151,6 +159,9 @@ def summarize(
         excluded_short=len(short),
         simulated_rows=sum(1 for o in used if o.simulated),
         live_rows=sum(1 for o in used if not o.simulated),
+        live_market_rows=sum(1 for o in used if o.market_data == "LIVE"),
+        synthetic_rows=sum(1 for o in used if o.market_data == "SYNTHETIC"),
+        legacy_rows=sum(1 for o in used if o.market_data == "UNKNOWN_LEGACY"),
         horizon_s=max(horizons) if len(horizons) == 1 else None,
         buckets=buckets,
     )

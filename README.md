@@ -415,6 +415,60 @@ validated with `plistlib`), plus `shellcheck` and `bash -n`. They have **not** b
 real macOS machine from this environment; `solana-sniper smoke-test`, `./doctor.sh` and
 `./status.sh` will show immediately if launchd or a provider is unhappy on your Mac.
 
+## 11b. Entry lifecycle: latch, hysteresis and the entry-attempt audit trail
+
+The first live paper run qualified two tokens and entered neither: qualification was a one-tick
+edge trigger (`QUALIFIED` at 67, back to `MONITORING` at 63 one tick later while the quote was
+still in flight), the acceleration feature flipped sign purely because a price surge rolled from
+the "current" into the "previous" 10-second window, GeckoTerminal-discovered tokens carry no
+decimals and a single rate-limited metadata fetch was never retried (so no quote was ever
+requested), and nothing durable said why. The lifecycle is now:
+
+```
+MONITORING --score >= min_score and checks pass--> QUALIFIED (latched for qualification_latch_s)
+   ^                                                 |  decimals -> sizing -> BUY quote -> SELL quote
+   |  abandon: score < min_score - hysteresis,       |  -> impact / round-trip loss -> post-quote
+   |  hard block (stale data, checks, velocity,      |     validation -> BUY_SIGNAL
+   |  sizing zero, round trip not viable),           v
+   |  latch expired without a signal             BUY_SIGNAL -> AWAITING_CONFIRMATION -> OPEN
+   +---------------- REJECTED on any fatal safety check or liquidity collapse (immediately)
+```
+
+* `entry.qualification_hysteresis` (default 8): a latched candidate is abandoned only below
+  `min_score - 8`. A 67 -> 63 wobble continues; 67 -> 42 abandons. Hysteresis never bridges a
+  hard block, a fatal check, a liquidity collapse, a stale feed or bad round-trip economics.
+* `entry.qualification_latch_s` (default 8): the bounded window to finish validation. At expiry
+  the attempt is recorded as `EXPIRED` with what was still pending; a candidate that is still
+  fully qualified gets another window, at most `max_entry_attempts` per candidate. An abandoned
+  window puts the token in `cooldown_after_abandon_s` before it can re-qualify. No candidate
+  stays latched forever.
+* Post-quote validation checks execution viability (round-trip loss, price impact, sell quote),
+  data freshness, fatal checks, hard blocks, sizing and a severe momentum reversal
+  (`severe_momentum_60s`); a score inside the hysteresis band does not cancel a viable quote.
+* `entry.stale_grace_during_quote_s` (default 5): while a quote is in flight the stale
+  transition waits this long beyond `market_data.stale_after_s`; a signal is never generated on
+  data older than `stale_after_s`. `market_data.priority_poll_interval_s` refreshes latched,
+  signalled and open mints on a faster lane, and throttled DexScreener polls are counted and
+  named in the stale reason (`no data for 21s (dexscreener RATE_LIMITED)`) instead of looking
+  like a token with no data.
+* Mint metadata (decimals, authorities) is retried with a bounded backoff
+  (`metadata_retry_s`, `metadata_max_attempts`) instead of once.
+* Acceleration is the mean of `acceleration_smoothing_samples` raw samples spaced
+  `acceleration_sample_spacing_s` apart: one print moves it by 1/N of its raw swing; a sustained
+  reversal still removes the credit after N spacings. Weight and normalisation are unchanged.
+
+**Audit trail.** Every latch window is one `entry_attempts` row (qualified score, features and
+checks at qualification, decimals status, sizing, quote attempts/status/error, price impacts,
+round-trip loss, post-quote score, score band and hysteresis holds, final decision
+`BUY_SIGNAL | ABANDONED | EXPIRED | HARD_REJECT | QUOTE_FAILED | SIZING_ZERO | STALE |
+CANCELLED`, block reason, timestamps). Open windows are closed as `CANCELLED` at shutdown.
+
+```bash
+solana-sniper --paper <session> entry-attempts        # one row per latch window + decision counts
+solana-sniper --paper <session> entry-attempts -v     # full trail per attempt
+solana-sniper --paper <session> inspect <MINT>        # attempts first, then the recorded history
+```
+
 ## 12. Outcome measurement (`evaluate`)
 
 The engine cannot know which token will go up. What it can do is record, for every candidate it
@@ -433,6 +487,11 @@ trust it with a single confirmation. That is what `OutcomeTracker` (`strategy/ou
   ends, then released.
 * On shutdown, rows still in flight are persisted with `truncated: true`; `evaluate` excludes
   them unless `--include-truncated` is given.
+* Every row carries two provenances: `market_data` (`LIVE` real Solana observations, `SYNTHETIC`
+  the offline world, `UNKNOWN_LEGACY` before schema version 4) and `execution` (`SIMULATED` for
+  paper/dry-run, `MANUAL_SIGNAL` for live signal mode). A paper session is `LIVE` market data
+  with `SIMULATED` execution and is never described as synthetic; its multiples are still
+  passive price paths, not executable returns.
 * `evaluate` prints, per group (all followed, rejected, never qualified, qualified, signalled,
   entered, and score buckets <40 / 40–59 / 60–74 / 75–89 / 90+): n, share that reached ≥2x, ≥5x,
   ≥10x with 95% Wilson intervals, median peak, median end, median drawdown, liquidity-pull rate,

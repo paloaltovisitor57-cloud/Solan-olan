@@ -61,6 +61,8 @@ class Metrics:
         "storage_dropped",
         "outcomes_followed",
         "outcomes_finalized",
+        "entry_attempts",
+        "market_polls_throttled",
     )
 
     LATENCIES = (

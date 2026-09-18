@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
+from typing import Any
 
 from solana_sniper.config.settings import MarketDataConfig
 from solana_sniper.domain.clock import Clock
@@ -50,6 +51,10 @@ class MarketDataService:
         self.name = "market-data"
         self.kind = "http-poll"
         self._last_success_at: datetime | None = None
+        self.last_throttled_at: datetime | None = None
+        self.last_error: str | None = None
+        self.governor: Any = None  # set by the bootstrap: provider health for stale reasons
+        self.priority_polls = 0
 
     def is_connected(self) -> bool:
         """True when a poll succeeded recently (or no polling provider is configured)."""
@@ -93,12 +98,20 @@ class MarketDataService:
     def watched(self) -> list[str]:
         return list(self._tracked)
 
-    async def _poll_once(self, provider: PollingMarketDataProvider) -> None:
-        # Priority mints (open positions, pending signals) go first so they are refreshed
-        # even when the tracked set exceeds what one interval can cover.
+    async def _poll_once(
+        self, provider: PollingMarketDataProvider, *, only_priority: bool = False
+    ) -> None:
+        # Priority mints (open positions, latched/qualified candidates, pending signals) go first
+        # so they are refreshed even when the tracked set exceeds what one interval can cover;
+        # the priority lane polls just them on a faster cadence.
         ordered: list[str] = []
         seen: set[str] = set()
-        for m in list(self._priority()) + list(self._tracked):
+        universe = (
+            list(self._priority())
+            if only_priority
+            else list(self._priority()) + list(self._tracked)
+        )
+        for m in universe:
             if m in self._tracked and m not in seen and provider.supports(self._tracked[m]):
                 ordered.append(m)
                 seen.add(m)
@@ -116,6 +129,9 @@ class MarketDataService:
                 except asyncio.CancelledError:
                     raise
                 except (RateLimitedError, ProviderUnavailableError) as exc:
+                    self.last_throttled_at = datetime.now(tz=UTC)
+                    self.last_error = safe_exception(exc)[:160]
+                    self._metrics.inc("market_polls_throttled")
                     log.debug(
                         "market_poll_throttled", provider=provider.name, error=safe_exception(exc)
                     )
@@ -137,7 +153,10 @@ class MarketDataService:
                 await self._emit_snapshot(snap)
 
         await asyncio.gather(*(run_batch(b) for b in batches))
-        self.polls += 1
+        if only_priority:
+            self.priority_polls += 1
+        else:
+            self.polls += 1
 
     async def _poll_loop(self, provider: PollingMarketDataProvider) -> None:
         interval = max(0.2, self._config.poll_interval_s)
@@ -147,9 +166,35 @@ class MarketDataService:
             elapsed = self._clock.monotonic() - started
             await asyncio.sleep(max(0.05, interval - elapsed))
 
+    async def _priority_loop(self, provider: PollingMarketDataProvider) -> None:
+        """Faster refresh for the few mints an entry or exit decision depends on."""
+        interval = max(0.1, self._config.priority_poll_interval_s)
+        while True:
+            started = self._clock.monotonic()
+            if self._priority():
+                await self._poll_once(provider, only_priority=True)
+            elapsed = self._clock.monotonic() - started
+            await asyncio.sleep(max(0.05, interval - elapsed))
+
+    def provider_note(self) -> str:
+        """Short provider-health suffix for stale reasons, e.g. ' (dexscreener RATE_LIMITED)'."""
+        if self.governor is None:
+            return ""
+        limited = [
+            f"{name} {info['state']}"
+            for name, info in self.governor.health().items()
+            if info.get("state") != "HEALTHY"
+        ]
+        return f" ({', '.join(limited)})" if limited else ""
+
     async def run(self) -> None:
         tasks = [
             asyncio.create_task(self._poll_loop(p), name=f"md-{p.name}") for p in self._polling
+        ]
+        tasks += [
+            asyncio.create_task(self._priority_loop(p), name=f"md-prio-{p.name}")
+            for p in self._polling
+            if self._config.priority_poll_interval_s < self._config.poll_interval_s
         ]
         if not tasks:
             await asyncio.Event().wait()

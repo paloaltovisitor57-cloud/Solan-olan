@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from solana_sniper.config.settings import OutcomesConfig
+from solana_sniper.domain.enums import ExecutionProvenance, MarketDataProvenance
 from solana_sniper.domain.models import MarketSnapshot
 
 
@@ -48,6 +49,8 @@ class OutcomeState:
     last_observed_at: datetime | None = None
     reject_reason: str | None = None
     simulated: bool = False
+    market_data: MarketDataProvenance = MarketDataProvenance.UNKNOWN_LEGACY
+    execution: ExecutionProvenance = ExecutionProvenance.SIMULATED
     post_qualified_max: Decimal = field(default=Decimal(0))
 
 
@@ -78,8 +81,10 @@ class Outcome:
     exit_reason: str | None
     liquidity_collapsed: bool
     reject_reason: str | None
-    simulated: bool
+    simulated: bool  # execution was simulated (kept for older rows; see execution)
     truncated: bool = False  # finalised early (shutdown) before the horizon elapsed
+    market_data: MarketDataProvenance = MarketDataProvenance.UNKNOWN_LEGACY
+    execution: ExecutionProvenance = ExecutionProvenance.SIMULATED
 
     def reached(self, multiple: float) -> bool:
         return self.max_multiple >= multiple
@@ -92,9 +97,20 @@ class Outcome:
 class OutcomeTracker:
     """Follows tokens after the engine has made its decision and records what happened."""
 
-    def __init__(self, config: OutcomesConfig, *, simulated: bool) -> None:
+    def __init__(
+        self,
+        config: OutcomesConfig,
+        *,
+        simulated: bool,
+        market_data: MarketDataProvenance = MarketDataProvenance.LIVE,
+        execution: ExecutionProvenance | None = None,
+    ) -> None:
         self._cfg = config
         self._simulated = simulated
+        self._market = market_data
+        self._execution = execution or (
+            ExecutionProvenance.SIMULATED if simulated else ExecutionProvenance.MANUAL_SIGNAL
+        )
         self._states: dict[str, OutcomeState] = {}
         # One window per mint per process: a token is measured from its first sight, never
         # re-started after its horizon while it is still a candidate. Bounded LRU of mints.
@@ -106,6 +122,14 @@ class OutcomeTracker:
     @property
     def enabled(self) -> bool:
         return self._cfg.enabled
+
+    @property
+    def market_data(self) -> MarketDataProvenance:
+        return self._market
+
+    @property
+    def execution(self) -> ExecutionProvenance:
+        return self._execution
 
     def following(self) -> list[str]:
         return list(self._states)
@@ -147,6 +171,8 @@ class OutcomeTracker:
             observations=1,
             last_observed_at=now,
             simulated=self._simulated,
+            market_data=self._market,
+            execution=self._execution,
         )
         return True
 
@@ -255,6 +281,8 @@ class OutcomeTracker:
             reject_reason=st.reject_reason,
             simulated=st.simulated,
             truncated=truncated,
+            market_data=st.market_data,
+            execution=st.execution,
         )
 
     def finalize_due(self, now: datetime) -> list[Outcome]:

@@ -29,6 +29,7 @@ from solana_sniper.domain.enums import FillProvenance, Venue
 from solana_sniper.domain.models import (
     BuySignal,
     CheckReport,
+    EntryAttempt,
     EntryScore,
     ErrorRecord,
     ExecutionRecord,
@@ -50,6 +51,7 @@ from solana_sniper.storage.models import (
     Base,
     CheckRow,
     DecisionRow,
+    EntryAttemptRow,
     ErrorRow,
     ExecutionRecordRow,
     FeatureRow,
@@ -86,7 +88,7 @@ WriteOp = Callable[[AsyncSession], Awaitable[None]]
 # is counted per kind, logged, and degrades health.
 CRITICAL_KINDS = frozenset({"fill", "position", "ledger", "account_state", "outcome", "session"})
 IMPORTANT_KINDS = frozenset(
-    {"token", "token_state", "signal", "decision", "execution_record", "milestone"}
+    {"token", "token_state", "signal", "decision", "execution_record", "milestone", "entry_attempt"}
 )
 TELEMETRY_KINDS = frozenset(
     {
@@ -186,6 +188,9 @@ class Repository:
         self.last_flush_at: datetime | None = None
         self.last_flush_error: str | None = None
         self._drop_log_at: dict[str, float] = {}
+        # Test hook: awaited at the start of every batch commit (inside the writer lock). Tests
+        # use it to hold a batch "in flight" deterministically instead of racing a timer.
+        self.batch_hook: Callable[[Sequence[_Op]], Awaitable[None]] | None = None
 
     async def init(self) -> None:
         async with self._engine.begin() as conn:
@@ -276,6 +281,8 @@ class Repository:
         cannot poison the others; every op that still fails is counted per record kind."""
         started = time.perf_counter()
         async with self._write_lock:
+            if self.batch_hook is not None:
+                await self.batch_hook(ops)
             for attempt in range(2):
                 try:
                     async with self._sessions() as session:
@@ -862,6 +869,8 @@ class Repository:
                     reject_reason=o.reject_reason,
                     simulated=o.simulated,
                     truncated=o.truncated,
+                    market_provenance=str(o.market_data),
+                    execution_provenance=str(o.execution),
                     payload=to_jsonable(o),
                 )
             )
@@ -900,6 +909,52 @@ class Repository:
                 .all()
             )
         return [dataclass_from_dict(Outcome, r.payload) for r in rows]
+
+    def _entry_attempt_op(self, a: EntryAttempt) -> WriteOp:
+        payload = to_jsonable(a)
+
+        async def op(s: AsyncSession) -> None:
+            await s.merge(
+                EntryAttemptRow(
+                    attempt_id=a.attempt_id,
+                    session_id=a.session_id,
+                    mint=a.mint,
+                    symbol=a.symbol,
+                    qualified_at=a.qualified_at,
+                    completed_at=a.completed_at,
+                    qualified_score=a.qualified_score,
+                    post_quote_score=a.post_quote_score,
+                    final_decision=str(a.final_decision),
+                    block_reason=(a.block_reason or None) and a.block_reason[:300],
+                    payload=payload,
+                )
+            )
+
+        return op
+
+    def save_entry_attempt(self, a: EntryAttempt) -> None:
+        """Upsert (IMPORTANT class: queued, never dropped). Called when the attempt opens and
+        whenever it changes; the completed record is the audit trail."""
+        self.persist(self._entry_attempt_op(a), "entry_attempt")
+
+    async def save_entry_attempt_now(self, a: EntryAttempt) -> None:
+        await self.persist_now(self._entry_attempt_op(a), "entry_attempt")
+
+    async def entry_attempts(
+        self, *, session_id: str | None = None, mint: str | None = None, limit: int = 500
+    ) -> list[EntryAttempt]:
+        async with self._sessions() as s:
+            stmt = select(EntryAttemptRow)
+            if session_id is not None:
+                stmt = stmt.where(EntryAttemptRow.session_id == session_id)
+            if mint is not None:
+                stmt = stmt.where(EntryAttemptRow.mint == mint)
+            rows = (
+                (await s.execute(stmt.order_by(EntryAttemptRow.qualified_at.asc()).limit(limit)))
+                .scalars()
+                .all()
+            )
+        return [dataclass_from_dict(EntryAttempt, r.payload) for r in rows]
 
     def save_error(self, e: ErrorRecord) -> None:
         async def op(s: AsyncSession) -> None:
@@ -1235,6 +1290,8 @@ class Repository:
                 ("ledger", LedgerRow),
                 ("errors", ErrorRow),
                 ("outcomes", OutcomeRow),
+                ("quotes", QuoteRow),
+                ("entry_attempts", EntryAttemptRow),
             ):
                 out[name] = len((await s.execute(select(model))).scalars().all())
         return out

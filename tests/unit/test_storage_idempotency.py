@@ -55,17 +55,26 @@ async def test_duplicate_mint_in_one_batch_from_two_providers(tmp_path: Path) ->
 async def test_concurrent_duplicate_persistence_is_idempotent(tmp_path: Path) -> None:
     """A background batch holding the mint is mid-commit while another write path (a synchronous
     save) persists the same mint: this raised UNIQUE constraint failed on the real machine."""
-    repo = _repo(tmp_path, flush_interval_s=0.5)
+    repo = _repo(tmp_path, flush_interval_s=0.05)
     await repo.init()
     repo.start()
     token = make_token("MintConc")
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def hold_first_batch(ops: object) -> None:
+        if not started.is_set():
+            started.set()
+            await release.wait()  # the writer's batch is now deterministically "in flight"
+
+    repo.batch_hook = hold_first_batch
     repo.save_token(token)
-    for _ in range(400):
-        await asyncio.sleep(0.005)
-        if repo._inflight is not None and not repo._inflight.done():
-            break
-    assert repo._inflight is not None and not repo._inflight.done(), "writer batch not in flight"
-    await repo.save_token_now(replace(token, source="dexscreener"))
+    await asyncio.wait_for(started.wait(), 5)
+    assert repo._inflight is not None and not repo._inflight.done()
+    concurrent = asyncio.create_task(repo.save_token_now(replace(token, source="dexscreener")))
+    await asyncio.sleep(0)  # the synchronous save is queued behind the held batch
+    release.set()
+    await concurrent
     await repo.flush()
     rows = await _token_rows(repo)
     assert repo.failures == 0, repo.last_flush_error

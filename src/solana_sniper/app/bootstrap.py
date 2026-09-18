@@ -36,7 +36,7 @@ from solana_sniper.discovery.geckoterminal import GeckoTerminalDiscovery
 from solana_sniper.discovery.pumpportal import PumpPortalClient, PumpPortalDiscovery
 from solana_sniper.discovery.service import DiscoveryService
 from solana_sniper.domain.clock import Clock, SystemClock
-from solana_sniper.domain.enums import RunMode, Urgency
+from solana_sniper.domain.enums import ExecutionProvenance, MarketDataProvenance, RunMode, Urgency
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo, TradeEvent
 from solana_sniper.execution.base import ExecutionInterface
 from solana_sniper.execution.manual import DryRunExecution, ManualExecution
@@ -249,6 +249,7 @@ class Runtime:
             for p in self.account.open_positions:
                 await self.repo.save_position_now(p)
             await self.engine.finalize_outcomes()
+            await self.engine.finalize_entry_attempts()
             await self.repo.end_session()
         await self.repo.close()
         with contextlib.suppress(Exception):
@@ -332,6 +333,7 @@ def build_runtime(
         emit_trade=emit_trade,
         priority_mints=priority,
     )
+    market.governor = http.governor
     discovery = DiscoveryService(settings.discovery, clock, metrics, emit_token)
     background: list[tuple[str, Task]] = []
     probes: list[ConnectionProbe] = []
@@ -457,7 +459,11 @@ def build_runtime(
         milestones=MilestoneTracker(
             settings.risk.milestones_eur, sid, settings.risk.milestone_hysteresis_pct
         ),
-        features=FeatureEngine(settings.market_data.stale_after_s),
+        features=FeatureEngine(
+            settings.market_data.stale_after_s,
+            acceleration_samples=settings.entry.acceleration_smoothing_samples,
+            acceleration_spacing_s=settings.entry.acceleration_sample_spacing_s,
+        ),
         checker=checker,
         scorer=EntryScorer(settings.entry, settings.filters),
         gate=EntryGate(settings.entry, checker),
@@ -470,7 +476,14 @@ def build_runtime(
         liquidity=liquidity,
         market=market,
         tracker=tracker,
-        outcomes=OutcomeTracker(settings.outcomes, simulated=mode is not RunMode.LIVE),
+        outcomes=OutcomeTracker(
+            settings.outcomes,
+            simulated=mode is not RunMode.LIVE,
+            market_data=MarketDataProvenance.SYNTHETIC if synthetic else MarketDataProvenance.LIVE,
+            execution=ExecutionProvenance.MANUAL_SIGNAL
+            if mode is RunMode.LIVE
+            else ExecutionProvenance.SIMULATED,
+        ),
         metrics=metrics,
     )
     engine = Engine(settings, deps, mode=mode, session_id=sid)

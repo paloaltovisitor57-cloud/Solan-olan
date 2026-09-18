@@ -72,9 +72,18 @@ def _volatility(snaps: list[MarketSnapshot]) -> float | None:
 
 
 class FeatureEngine:
-    def __init__(self, stale_after_s: float, peak_window_s: float = 300.0) -> None:
+    def __init__(
+        self,
+        stale_after_s: float,
+        peak_window_s: float = 300.0,
+        *,
+        acceleration_samples: int = 4,
+        acceleration_spacing_s: float = 2.5,
+    ) -> None:
         self._stale_after = stale_after_s
         self._peak_window = peak_window_s
+        self._acc_samples = max(1, acceleration_samples)
+        self._acc_spacing = max(0.1, acceleration_spacing_s)
 
     def compute(
         self,
@@ -95,7 +104,8 @@ class FeatureEngine:
         m60 = _return(track, now, 60)
         m180 = _return(track, now, 180)
         prev10 = _return(track, now, 20, 10)
-        acceleration = (m10 - prev10) if (m10 is not None and prev10 is not None) else None
+        acceleration_raw = (m10 - prev10) if (m10 is not None and prev10 is not None) else None
+        acceleration = self._smoothed_acceleration(track, now, acceleration_raw)
 
         liq_growth = _liquidity_return(track, now, 60)
         liq_recent = _liquidity_return(track, now, 30)
@@ -171,6 +181,7 @@ class FeatureEngine:
             momentum_60s=m60,
             momentum_180s=m180,
             acceleration=acceleration,
+            acceleration_raw=acceleration_raw,
             liquidity_growth_60s=liq_growth,
             liquidity_acceleration=liq_accel,
             volume_acceleration=vol_accel,
@@ -200,6 +211,23 @@ class FeatureEngine:
         if cur.volume_5m_usd is None or then.volume_5m_usd is None or then.volume_5m_usd <= 0:
             return None
         return float((cur.volume_5m_usd - then.volume_5m_usd) / then.volume_5m_usd)
+
+    def _smoothed_acceleration(
+        self, track: TokenTrack, now: datetime, current: float | None
+    ) -> float | None:
+        """Mean of the raw acceleration sampled now and at N-1 earlier instants. Stateless (it is
+        recomputed from the snapshots), so replay and live evaluation agree exactly."""
+        if current is None:
+            return None
+        samples = [current]
+        for k in range(1, self._acc_samples):
+            shift = k * self._acc_spacing
+            m10 = _return(track, now, 10 + shift, shift)
+            prev10 = _return(track, now, 20 + shift, 10 + shift)
+            if m10 is None or prev10 is None:
+                break  # not enough history yet: average what exists
+            samples.append(m10 - prev10)
+        return sum(samples) / len(samples)
 
     @staticmethod
     def _snapshot_field_growth(

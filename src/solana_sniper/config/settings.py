@@ -200,6 +200,9 @@ class MarketDataConfig(StrictModel):
     trade_window_s: float = Field(default=300.0, gt=0, le=86400)
     buffer_seconds: float = Field(default=900.0, gt=0, le=86400)
     max_concurrent_requests: int = Field(default=6, ge=1, le=100)
+    # Candidates that are QUALIFIED / signalled / open positions are polled on their own faster
+    # cadence in addition to the full sweep, so an entry decision never waits a full sweep.
+    priority_poll_interval_s: float = Field(default=0.75, ge=0.1, le=60)
 
 
 class FiltersConfig(StrictModel):
@@ -285,6 +288,32 @@ class EntryConfig(StrictModel):
     momentum_full_score: float = Field(default=0.25, gt=0)
     liquidity_growth_full_score: float = Field(default=0.30, gt=0)
     max_pending_signals: int = Field(default=3, ge=1, le=100)
+    # Acceleration is the difference between the last 10 s return and the previous 10 s return.
+    # Raw, that difference flips sign purely because a surge rolls from the "current" into the
+    # "previous" window (the BONKCAT case: +20% -> -18% in one second with the price flat), so
+    # the feature is the mean of `acceleration_smoothing_samples` raw samples taken
+    # `acceleration_sample_spacing_s` apart. One noisy print then moves it by 1/N of its raw
+    # swing while a sustained reversal still shows fully after N spacings.
+    # Qualification lifecycle. A candidate qualifies at min_score and then stays latched for
+    # qualification_latch_s while decimals, sizing and the round-trip quote are obtained. It is
+    # demoted only when the score falls below min_score - qualification_hysteresis, a hard block
+    # appears (stale data, failed checks, sizing zero, bad round-trip economics, fatal safety
+    # check) or the latch expires without a signal. 8 points is conservative: the live wobbles
+    # that broke entries were 3-10 points within a second, while a real collapse is 20+.
+    qualification_hysteresis: float = Field(default=8.0, ge=0, le=50)
+    qualification_latch_s: float = Field(default=8.0, ge=1, le=120)
+    max_entry_attempts: int = Field(default=6, ge=1, le=100)  # latch windows per candidate
+    # After an abandoned window (bad economics, failed quote, sizing zero, collapse) the token
+    # needs fresh evidence: it cannot re-qualify for this long.
+    cooldown_after_abandon_s: float = Field(default=30.0, ge=0, le=3600)
+    severe_momentum_60s: float = Field(default=-0.15, le=0)  # abandon while latched below this
+    # While a quote is in flight the stale transition waits this long beyond stale_after_s
+    # (bounded); a signal is never generated on data older than stale_after_s.
+    stale_grace_during_quote_s: float = Field(default=5.0, ge=0, le=60)
+    metadata_retry_s: float = Field(default=5.0, ge=0.5, le=300)
+    metadata_max_attempts: int = Field(default=8, ge=1, le=100)
+    acceleration_smoothing_samples: int = Field(default=4, ge=1, le=20)
+    acceleration_sample_spacing_s: float = Field(default=2.5, gt=0, le=60)
 
 
 class RiskProfile(StrictModel):

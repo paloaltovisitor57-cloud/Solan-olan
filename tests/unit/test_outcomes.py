@@ -17,6 +17,7 @@ from typer.testing import CliRunner
 from solana_sniper.cli.main import app
 from solana_sniper.config.settings import OutcomesConfig
 from solana_sniper.domain.clock import ManualClock
+from solana_sniper.domain.enums import MarketDataProvenance
 from solana_sniper.domain.models import MarketSnapshot
 from solana_sniper.storage.repository import Repository
 from solana_sniper.strategy.evaluation import (
@@ -217,7 +218,8 @@ def test_summarize_groups_excludes_truncated_and_short_rows() -> None:
     rep = summarize(rows, min_observations=5)
     assert rep.total_rows == 8 and rep.used_rows == 6
     assert rep.excluded_truncated == 1 and rep.excluded_short == 1
-    assert rep.simulated_rows == 5 and rep.live_rows == 1 and rep.mixed_provenance
+    assert rep.simulated_rows == 5 and rep.live_rows == 1
+    assert rep.legacy_rows == 6 and not rep.mixed_provenance  # all rows predate provenance
     assert rep.horizon_s == 600.0
     by = {b.name: b for b in rep.buckets}
     assert by["all followed"].n == 6
@@ -238,6 +240,17 @@ def test_summarize_groups_excludes_truncated_and_short_rows() -> None:
     rep2 = summarize(rows[:6], include_truncated=True, min_observations=1)
     assert rep2.used_rows == 6 and rep2.excluded_truncated == 0 and rep2.all_simulated
     assert summarize([]).used_rows == 0 and summarize([]).horizon_s is None
+    # market-data provenance is separate from execution provenance
+    paper = [
+        make_outcome(mint=f"p{i}", market_data=MarketDataProvenance.LIVE, simulated=True)
+        for i in range(3)
+    ]
+    synthetic = [make_outcome(mint="s1", market_data=MarketDataProvenance.SYNTHETIC)]
+    rep3 = summarize(paper)
+    assert rep3.live_market_rows == 3 and rep3.simulated_rows == 3 and not rep3.all_synthetic
+    rep4 = summarize(synthetic)
+    assert rep4.all_synthetic and rep4.synthetic_rows == 1
+    assert summarize(paper + synthetic).mixed_provenance
 
 
 # ------------------------------------------------------------------ storage
@@ -284,6 +297,7 @@ def test_evaluate_command_reports_rates_with_caveats(tmp_path: Path) -> None:
                 signalled=i < 2,
                 entered=i == 0,
                 closed_pnl_pct=0.1 if i == 0 else None,
+                market_data=MarketDataProvenance.LIVE,
             )
             for i in range(4)
         ]
@@ -299,9 +313,11 @@ def test_evaluate_command_reports_rates_with_caveats(tmp_path: Path) -> None:
     assert "forward outcomes: 4 tokens" in out and "horizon 600s" in out
     assert "all followed" in out and "score 90+" in out and "entered" in out
     assert "1 truncated at shutdown" in out
-    assert "4 simulated/dry-run, 0 live-data" in out
-    assert "Wilson" in out and "do not predict" in out
-    assert "simulated or synthetic run" in out
+    flat = " ".join(out.split())  # prose lines wrap at the terminal width; never assert on that
+    assert "Market data: 4 live Solana" in flat and "4 simulated (paper/dry-run)" in flat
+    assert "Wilson" in flat and "do not predict" in flat
+    assert "live Solana market observations with simulated execution" in flat
+    assert "synthetic world" not in flat  # live paper rows are never called synthetic
     assert "99" not in out.split("excluded")[0]  # the truncated 99x row never enters the table
     # a session filter that matches nothing explains itself instead of printing a table
     res2 = runner.invoke(app, ["evaluate", "-c", str(config), "--session", "nope"])

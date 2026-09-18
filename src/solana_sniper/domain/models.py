@@ -15,6 +15,7 @@ from solana_sniper.domain.enums import (
     CheckVerdict,
     DecisionKind,
     DecisionSource,
+    EntryDecision,
     ExitReason,
     FillProvenance,
     LedgerEntryKind,
@@ -175,6 +176,7 @@ class FeatureVector:
     volatility_60s: float | None
     data_age_s: float
     stale: bool
+    acceleration_raw: float | None = None  # unsmoothed m10 - prev10 (diagnostics)
 
     def as_dict(self) -> dict[str, float | int | bool | str | None]:
         return {
@@ -189,6 +191,7 @@ class FeatureVector:
             "momentum_60s": self.momentum_60s,
             "momentum_180s": self.momentum_180s,
             "acceleration": self.acceleration,
+            "acceleration_raw": self.acceleration_raw,
             "liquidity_growth_60s": self.liquidity_growth_60s,
             "liquidity_acceleration": self.liquidity_acceleration,
             "volume_acceleration": self.volume_acceleration,
@@ -593,6 +596,62 @@ class PortfolioSnapshot:
     wins: int
     losses: int
     session_id: str = ""
+
+
+@dataclass(slots=True)
+class EntryAttempt:
+    """Durable audit record of one qualification latch window: why a qualified token did or did
+    not become a BUY signal. Opened when a candidate reaches QUALIFIED, updated as decimals,
+    sizing and quotes arrive, completed with exactly one final decision."""
+
+    attempt_id: str
+    session_id: str
+    mint: str
+    symbol: str | None
+    qualified_at: datetime
+    qualified_score: float
+    latch_until: datetime
+    qualified_features: dict[str, float | int | bool | str | None] = field(default_factory=dict)
+    qualified_checks: str = ""
+    attempt_number: int = 1
+    decimals_status: str = "unknown"  # "known:<n>" | "unknown" | "resolved"
+    sizing_attempted: bool = False
+    recommended_eur: Decimal | None = None
+    recommended_sol: Decimal | None = None
+    sizing_reason: str | None = None
+    quote_attempts: int = 0
+    quote_started_at: datetime | None = None
+    quote_finished_at: datetime | None = None
+    buy_quote_status: str = "not_attempted"  # not_attempted | ok | failed
+    sell_quote_status: str = "not_attempted"
+    quote_error: str | None = None
+    quote_ids: list[str] = field(default_factory=list)
+    entry_price_impact_pct: float | None = None
+    exit_price_impact_pct: float | None = None
+    round_trip_loss_pct: float | None = None
+    round_trip_viable: bool | None = None
+    post_quote_score: float | None = None
+    min_score_seen: float | None = None
+    max_score_seen: float | None = None
+    evaluations: int = 0
+    hysteresis_holds: int = 0  # evaluations that stayed latched with the score under min_score
+    final_decision: EntryDecision = EntryDecision.PENDING
+    block_reason: str | None = None
+    signal_id: str | None = None
+    completed_at: datetime | None = None
+
+    @property
+    def is_open(self) -> bool:
+        return self.final_decision is EntryDecision.PENDING
+
+    def note_score(self, score: float) -> None:
+        self.evaluations += 1
+        self.min_score_seen = (
+            score if self.min_score_seen is None else min(self.min_score_seen, score)
+        )
+        self.max_score_seen = (
+            score if self.max_score_seen is None else max(self.max_score_seen, score)
+        )
 
 
 @dataclass(frozen=True, slots=True)

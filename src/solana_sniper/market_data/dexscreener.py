@@ -18,7 +18,12 @@ from solana_sniper.discovery.parsing import (
 from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.enums import Venue
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo
-from solana_sniper.infra.http import HttpClient, HttpError
+from solana_sniper.infra.http import (
+    HttpClient,
+    HttpError,
+    ProviderUnavailableError,
+    RateLimitedError,
+)
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.redaction import safe_exception
 
@@ -124,6 +129,10 @@ class DexScreenerMarketData:
             chunk = list(mints[i : i + self.batch_size])
             try:
                 res = await self._http.get_json(f"{self._base}/tokens/v1/solana/{','.join(chunk)}")
+            except (RateLimitedError, ProviderUnavailableError):
+                if views:
+                    break  # keep what earlier chunks returned; the caller sees the throttle
+                raise
             except HttpError as exc:
                 log.warning("dexscreener_fetch_failed", count=len(chunk), error=safe_exception(exc))
                 continue

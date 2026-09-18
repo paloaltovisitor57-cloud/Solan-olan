@@ -159,7 +159,7 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
     tmp_path: Path, clock: ManualClock
 ) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path}/legacy.db"
-    assert await run_migrations(url) == [1, 2]
+    assert await run_migrations(url) == [1, 2, 3]
     engine = create_async_engine(url)
     now = datetime.now(tz=UTC).isoformat()
     legacy_fill = {
@@ -190,7 +190,7 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
         "state": "OPEN",
     }
     async with engine.begin() as conn:
-        await conn.execute(text("DELETE FROM schema_version WHERE version = 2"))
+        await conn.execute(text("DELETE FROM schema_version WHERE version >= 2"))
         await conn.execute(
             text(
                 "INSERT INTO fills (fill_id, session_id, signal_id, mint, side, filled_at, payload)"
@@ -229,8 +229,8 @@ async def test_migration_v2_flags_legacy_rows_without_guessing(
             {"t": datetime.now(tz=UTC)},
         )
     await engine.dispose()
-    assert await run_migrations(url) == [2]
-    assert await schema_version(url) == 2
+    assert await run_migrations(url) == [2, 3]
+    assert await schema_version(url) == 3
     engine = create_async_engine(url)
     async with engine.begin() as conn:
         fill_payload = json.loads(

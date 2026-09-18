@@ -8,19 +8,68 @@ from __future__ import annotations
 
 from decimal import Decimal
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from solana_sniper.config.base58 import is_solana_public_key
 from solana_sniper.domain.enums import RiskProfileName
 
 
+class ConfigValidationError(ValueError):
+    """Validation failure whose text names field paths and reasons but never the rejected
+    input (a mistyped private key must not surface in an exception message, log or report)."""
+
+    def __init__(self, problems: list[str]) -> None:
+        self.problems = problems
+        super().__init__("configuration invalid: " + "; ".join(problems))
+
+
+def validation_problems(exc: ValidationError) -> list[str]:
+    """Field paths and reasons only. Nested StrictModels raise ConfigValidationError from their
+    own __init__ (pydantic wraps it as a value error at the parent field); unwrap those so the
+    full dotted path is reported. Inputs are never included."""
+    out: list[str] = []
+    for err in exc.errors(include_url=False, include_input=False, include_context=True):
+        loc = ".".join(str(part) for part in err.get("loc", ()))
+        nested = (err.get("ctx") or {}).get("error")
+        if isinstance(nested, ConfigValidationError):
+            for problem in nested.problems:
+                inner_loc, _, reason = problem.partition(": ")
+                path = f"{loc}.{inner_loc}" if loc and inner_loc != "<root>" else (loc or inner_loc)
+                out.append(f"{path}: {reason}")
+            continue
+        out.append(f"{loc or '<root>'}: {err.get('msg', 'invalid')}")
+    return out
+
+
 class StrictModel(BaseModel):
-    """Configuration models reject unknown keys (typos) and non-finite numbers."""
+    """Configuration models reject unknown keys (typos) and non-finite numbers, and raise
+    ConfigValidationError (input-free) instead of pydantic's ValidationError."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    def __init__(self, /, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as exc:
+            raise ConfigValidationError(validation_problems(exc)) from None
+
+    @classmethod
+    def model_validate(cls, obj: Any, **kwargs: Any) -> Self:
+        try:
+            return super().model_validate(obj, **kwargs)
+        except ValidationError as exc:
+            raise ConfigValidationError(validation_problems(exc)) from None
 
 
 DiscoverySource = Literal["pumpportal", "geckoterminal", "dexscreener", "synthetic"]
@@ -418,13 +467,29 @@ class DashboardConfig(StrictModel):
 
 
 class Settings(BaseSettings):
+    """Top level is strict too: unknown keys are errors. Dotenv files are *not* read here (they
+    may legitimately contain service and unrelated variables); the loader supplies a filtered
+    dotenv source that only forwards known application keys."""
+
     model_config = SettingsConfigDict(
         env_prefix="SNIPER_",
         env_nested_delimiter="__",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
+        env_file=None,
+        extra="forbid",
     )
+
+    def __init__(self, /, **data: Any) -> None:
+        try:
+            super().__init__(**data)
+        except ValidationError as exc:
+            raise ConfigValidationError(validation_problems(exc)) from None
+
+    @classmethod
+    def model_validate(cls, obj: Any, **kwargs: Any) -> Self:
+        try:
+            return super().model_validate(obj, **kwargs)
+        except ValidationError as exc:
+            raise ConfigValidationError(validation_problems(exc)) from None
 
     providers: ProvidersConfig = ProvidersConfig()
     discovery: DiscoveryConfig = DiscoveryConfig()

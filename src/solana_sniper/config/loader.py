@@ -24,9 +24,10 @@ from typing import Any
 
 import yaml
 from pydantic import BaseModel, ValidationError
+from pydantic_settings import DotEnvSettingsSource
 
 from solana_sniper.config.paths import DB_DIR, ENV_FILE, LOG_DIR, configured_home, ensure_home
-from solana_sniper.config.settings import Settings
+from solana_sniper.config.settings import ConfigValidationError, Settings
 from solana_sniper.telemetry.redaction import register_secret, register_url_secrets
 
 DEFAULT_CONFIG_ENV = "SNIPER_CONFIG"
@@ -216,6 +217,24 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
     if problems:
         raise ConfigError(problems)
 
+    known = known_env_prefixes(Settings)
+    present_env_files = [f for f in env_files if Path(f).exists()]
+
+    class _FilteredDotEnv(DotEnvSettingsSource):
+        """Dotenv source that forwards only known application keys. Service variables
+        (SNIPER_SERVICE_MODE, ...) and unrelated tool variables are dropped here, so the strict
+        Settings model never sees them; unknown SNIPER_* keys were already reported above."""
+
+        def _read_env_files(self) -> Mapping[str, str | None]:
+            raw = super()._read_env_files()
+            return {
+                k: v
+                for k, v in raw.items()
+                if k.upper().startswith(ENV_PREFIX)
+                and k.upper() not in SERVICE_ENV_KEYS
+                and _env_name_known(k, known)
+            }
+
     class _YamlSettings(Settings):
         @classmethod
         def settings_customise_sources(  # type: ignore[override]
@@ -229,11 +248,21 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
             def yaml_source() -> dict[str, Any]:
                 return yaml_data
 
+            filtered_dotenv = _FilteredDotEnv(
+                settings_cls,
+                env_file=present_env_files,
+                env_file_encoding="utf-8",
+                env_prefix=ENV_PREFIX,
+                env_nested_delimiter="__",
+                case_sensitive=False,
+            )
             # highest priority first
-            return (env_settings, dotenv_settings, yaml_source, init_settings)
+            return (env_settings, filtered_dotenv, yaml_source, init_settings)
 
     try:
-        settings = _YamlSettings(_env_file=env_files)
+        settings = _YamlSettings()
+    except ConfigValidationError as exc:
+        raise ConfigError(exc.problems) from None
     except ValidationError as exc:
         raise ConfigError(_validation_problems(exc)) from None
     settings.config_path = path

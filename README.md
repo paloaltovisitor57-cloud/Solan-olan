@@ -367,8 +367,17 @@ mypy              # --strict via pyproject
   on-chain fill reconciliation, so no record is ever `VERIFIED_ONCHAIN`.
 * Databases written before schema version 2 are migrated on first start: legacy fills, positions
   and ledger rows are labelled `UNKNOWN_LEGACY` and legacy fill token amounts are kept under
-  `legacy_token_amount` because their unit was ambiguous (buys were UI, sells were raw). Legacy
-  open positions are still restored and valued from the displayed price, but they are flagged
-  `units?` and are not re-quoted, because their decimals are unverified.
+  `legacy_token_amount` because their unit was ambiguous (buys were UI, sells were raw). A legacy
+  record that said `simulated: true` keeps that evidence as `SIMULATED` provenance plus
+  `legacy_simulated: true`; schema version 3 repairs databases that the first version of the v2
+  migration had left as `UNKNOWN_LEGACY` + `simulated`. Legacy open positions are still restored
+  and valued from the displayed price, but they are flagged `units?` and are not re-quoted,
+  because their decimals are unverified.
+* Log redaction boundaries: structlog events (key-aware, nested mappings), standard-library
+  records created through `Logger.makeRecord` (message, `args`, `extra` attributes and traceback
+  text, including handlers registered before the app configured logging) and exception chains
+  as the traceback module would display them. Not covered: records built by code that bypasses
+  `Logger.makeRecord`, attributes a custom formatter reads from sources other than the record,
+  and output written outside the logging module (for example `print`).
 * The synthetic world is deliberately generous (runners pump several ×). It validates plumbing,
   not strategy profitability.

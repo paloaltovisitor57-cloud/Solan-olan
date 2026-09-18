@@ -34,6 +34,19 @@ _KV_RE = re.compile(
 )
 
 
+# pydantic renders rejected inputs as `input_value=...`; never let them through
+_INPUT_VALUE_RE = re.compile(r"(input_value=)(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"|[^,\]\s]+)")
+# mapping keys whose *whole* value is a credential, whatever it looks like
+_SENSITIVE_KEY_RE = re.compile(
+    r"(?i)^(?:.*(?:authorization|api[-_]?key|secret|token|password|passwd|pwd|cookie|"
+    r"signature|webhook|private|seed|mnemonic|credential).*)$"
+)
+
+
+def is_sensitive_key(key: object) -> bool:
+    return isinstance(key, str) and bool(_SENSITIVE_KEY_RE.match(key))
+
+
 class SecretRegistry:
     """Known secret values. Registered at config load; every log sink scrubs them."""
 
@@ -102,6 +115,7 @@ def scrub_text(text: str) -> str:
     text = _WEBHOOK_RE.sub(r"\1" + MASK, text)
     text = _QUERY_VALUE_RE.sub(r"\1" + MASK, text)
     text = _KV_RE.sub(r"\1" + MASK, text)
+    text = _INPUT_VALUE_RE.sub(r"\1" + MASK, text)
     return text
 
 
@@ -124,26 +138,55 @@ def safe_url(url: str | None) -> str:
     return f"{parts.scheme}://{host}{path}{suffix}"
 
 
+def _exception_message(exc: BaseException) -> str:
+    """Message text for one exception. pydantic ValidationErrors are rendered without inputs."""
+    errors = getattr(exc, "errors", None)
+    if callable(errors) and type(exc).__name__ == "ValidationError":
+        try:
+            items = errors(include_url=False, include_input=False, include_context=False)
+            parts = [
+                ".".join(str(x) for x in err.get("loc", ())) + ": " + str(err.get("msg", "invalid"))
+                for err in items
+            ]
+            return scrub_text("; ".join(parts))
+        except TypeError:
+            pass
+    return scrub_text(str(exc))
+
+
 def safe_exception(exc: BaseException, *, depth: int = 4) -> str:
-    """`Type: message` for the exception and its cause chain, every message scrubbed."""
+    """`Type: message` for the exception and its *displayed* chain, every message scrubbed.
+
+    Follows `__cause__`, and `__context__` only when the exception did not suppress it
+    (`raise ... from None`), mirroring what the traceback module would print.
+    """
     parts: list[str] = []
     current: BaseException | None = exc
     seen: set[int] = set()
     while current is not None and len(parts) < depth and id(current) not in seen:
         seen.add(id(current))
-        message = scrub_text(str(current))
+        message = _exception_message(current)
         parts.append(f"{type(current).__name__}: {message}" if message else type(current).__name__)
-        current = current.__cause__ or current.__context__
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif not current.__suppress_context__:
+            current = current.__context__
+        else:
+            current = None
     return " <- ".join(parts)
 
 
-def scrub_value(value: Any) -> Any:
+def scrub_value(value: Any, *, key: object = None) -> Any:
+    """Scrub a value recursively. When the mapping key names a credential the whole value is
+    masked regardless of its content (registered or not)."""
+    if is_sensitive_key(key) and value is not None and not isinstance(value, bool | int | float):
+        return MASK
     if isinstance(value, str):
         return scrub_text(value)
     if isinstance(value, BaseException):
         return safe_exception(value)
     if isinstance(value, Mapping):
-        return {k: scrub_value(v) for k, v in value.items()}
+        return {k: scrub_value(v, key=k) for k, v in value.items()}
     if isinstance(value, list):
         return [scrub_value(v) for v in value]
     if isinstance(value, tuple):
@@ -156,7 +199,7 @@ def scrub_event(
 ) -> MutableMapping[str, Any]:
     """structlog processor: scrub every value (including rendered exception text)."""
     for key in list(event_dict):
-        event_dict[key] = scrub_value(event_dict[key])
+        event_dict[key] = scrub_value(event_dict[key], key=key)
     return event_dict
 
 
@@ -179,9 +222,28 @@ def _scrubbing_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
     return record
 
 
+_ORIGINAL_MAKE_RECORD = logging.Logger.makeRecord
+
+
+def _scrubbing_make_record(self: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
+    """Logger.makeRecord wrapper: `extra` attributes are applied *after* the record factory, so
+    they are sanitised here (key-aware, registry, patterns) before any handler can format them."""
+    record = _ORIGINAL_MAKE_RECORD(self, *args, **kwargs)
+    extra = kwargs.get("extra") if "extra" in kwargs else (args[8] if len(args) > 8 else None)
+    if extra:
+        for key in extra:
+            if key in record.__dict__:
+                record.__dict__[key] = scrub_value(record.__dict__[key], key=key)
+    return record
+
+
 def install_record_factory() -> None:
+    """Install process-wide scrubbing for the standard library: message/args and traceback text
+    via the LogRecord factory, `extra` attributes via Logger.makeRecord. Both are idempotent."""
     if logging.getLogRecordFactory() is not _scrubbing_record_factory:
         logging.setLogRecordFactory(_scrubbing_record_factory)
+    if logging.Logger.makeRecord is not _scrubbing_make_record:
+        logging.Logger.makeRecord = _scrubbing_make_record  # type: ignore[method-assign]
 
 
 class ScrubbingFormatter(logging.Formatter):

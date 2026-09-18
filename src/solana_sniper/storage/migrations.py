@@ -56,7 +56,13 @@ async def _v2_provenance_and_units(conn: AsyncConnection) -> None:
             payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
             changed = False
             if "provenance" not in payload:
-                payload["provenance"] = "UNKNOWN_LEGACY"
+                # A legacy record that said simulated=True was a dry-run fill: that evidence is
+                # kept (SIMULATED is the weakest provenance, never verification). Anything else
+                # is UNKNOWN_LEGACY because estimated vs user-reported cannot be told apart.
+                payload["provenance"] = (
+                    "SIMULATED" if payload.get("simulated") else "UNKNOWN_LEGACY"
+                )
+                payload["legacy_simulated"] = bool(payload.get("simulated"))
                 changed = True
             if "units" not in payload:
                 payload["units"] = "UNKNOWN_LEGACY"
@@ -84,12 +90,39 @@ async def _v2_provenance_and_units(conn: AsyncConnection) -> None:
                 )
 
 
+async def _v3_repair_legacy_simulated(conn: AsyncConnection) -> None:
+    """Databases migrated by the first version of v2 hold fills/positions labelled UNKNOWN_LEGACY
+    while `simulated` is true, which the Fill model rejects. Restore the simulation evidence:
+    provenance SIMULATED, `legacy_simulated` recorded, units untouched, nothing verified."""
+    for table, key in (("fills", "fill_id"), ("positions", "position_id")):
+        rows = (await conn.execute(text(f"SELECT {key}, payload FROM {table}"))).all()
+        for row_id, raw in rows:
+            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            changed = False
+            if "legacy_simulated" not in payload and "provenance" in payload:
+                payload["legacy_simulated"] = bool(payload.get("simulated"))
+                changed = True
+            if payload.get("provenance") == "UNKNOWN_LEGACY" and payload.get("simulated") is True:
+                payload["provenance"] = "SIMULATED"
+                changed = True
+            if changed:
+                await conn.execute(
+                    text(f"UPDATE {table} SET payload = :payload WHERE {key} = :id"),
+                    {"payload": json.dumps(payload), "id": row_id},
+                )
+
+
 MIGRATIONS: list[tuple[int, str, Step]] = [
     (1, "initial schema", _v1_initial),
     (
         2,
         "provenance and token units (legacy rows flagged UNKNOWN_LEGACY)",
         _v2_provenance_and_units,
+    ),
+    (
+        3,
+        "repair legacy simulated records (UNKNOWN_LEGACY + simulated -> SIMULATED)",
+        _v3_repair_legacy_simulated,
     ),
 ]
 

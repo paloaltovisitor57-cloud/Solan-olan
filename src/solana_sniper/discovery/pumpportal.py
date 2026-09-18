@@ -7,10 +7,13 @@ streams (`subscribeTokenTrade`), as PumpPortal asks clients to use a single sock
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+
+from websockets.asyncio.client import ClientConnection
 
 from solana_sniper.discovery.base import EmitToken
 from solana_sniper.discovery.parsing import as_decimal, as_dict, as_str
@@ -100,6 +103,7 @@ class PumpPortalClient:
         min_backoff_s: float = 1.0,
         max_backoff_s: float = 30.0,
         ws_factory: Callable[..., ReconnectingWebSocket] | None = None,
+        ws_connect: Callable[[str], Awaitable[ClientConnection]] | None = None,
     ) -> None:
         self._clock = clock
         self._metrics = metrics
@@ -116,8 +120,10 @@ class PumpPortalClient:
             min_backoff_s=min_backoff_s,
             max_backoff_s=max_backoff_s,
             metrics=metrics,
+            connect=ws_connect,
         )
         self._task: asyncio.Task[None] | None = None
+        self._send_tasks: set[asyncio.Task[None]] = set()
         self.messages_seen = 0
         self._last_message_at: datetime | None = None
 
@@ -129,7 +135,21 @@ class PumpPortalClient:
 
     def on_new_token(self, handler: EmitToken) -> None:
         self._token_handlers.append(handler)
-        self._want_new_tokens = True
+        if not self._want_new_tokens:
+            self._want_new_tokens = True
+            # If the socket is already up, subscribe now; otherwise _resubscribe does it on connect.
+            self._spawn_send({"method": "subscribeNewToken"})
+
+    def _spawn_send(self, payload: dict[str, Any]) -> None:
+        if not self._ws.connected.is_set():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._send(payload))
+        self._send_tasks.add(task)
+        task.add_done_callback(self._send_tasks.discard)
 
     def on_trade(self, handler: TradeHandler) -> None:
         self._trade_handlers.append(handler)
@@ -192,12 +212,29 @@ class PumpPortalClient:
 
 
 class PumpPortalDiscovery:
+    """Registers with the shared client at construction so no create message is ever missed.
+
+    Tokens that arrive before the DiscoveryService starts consuming are buffered (bounded) and
+    flushed as soon as `run()` provides the sink.
+    """
+
     name = "pumpportal"
 
-    def __init__(self, client: PumpPortalClient) -> None:
+    def __init__(self, client: PumpPortalClient, buffer_size: int = 500) -> None:
         self._client = client
+        self._emit: EmitToken | None = None
+        self._buffer: deque[TokenInfo] = deque(maxlen=buffer_size)
+        client.on_new_token(self._forward)
+
+    async def _forward(self, token: TokenInfo) -> None:
+        if self._emit is None:
+            self._buffer.append(token)
+            return
+        await self._emit(token)
 
     async def run(self, emit: EmitToken) -> None:
-        self._client.on_new_token(emit)
-        # The shared client is run by the engine; discovery just registers and waits.
+        self._emit = emit
+        while self._buffer:
+            await emit(self._buffer.popleft())
+        # The shared client is run by the engine; discovery just forwards and waits.
         await asyncio.Event().wait()

@@ -325,7 +325,10 @@ mypy              # --strict via pyproject
 
 * Live provider connectivity could **not** be exercised from the build sandbox (all external hosts
   were blocked by its egress policy). The adapters are written against the documented API shapes and
-  tested with fixtures; `solana-sniper doctor` will tell you within seconds which provider fails.
+  tested with fixtures, and the *live composition* (PumpPortal WS + GeckoTerminal + DexScreener +
+  Solana RPC + Jupiter + CoinGecko) is driven end to end in `tests/integration/test_live_pipeline_mocked.py`
+  with the transports mocked. Real endpoints may still differ in detail; `solana-sniper doctor`
+  will tell you within seconds which provider fails.
 * Holder counts require Helius; on public RPC the holder-count check is UNKNOWN (concentration from
   `getTokenLargestAccounts` still works).
 * DexScreener does not expose a "new pairs" endpoint; PumpPortal + GeckoTerminal are the

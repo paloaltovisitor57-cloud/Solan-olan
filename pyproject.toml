@@ -58,6 +58,8 @@ ignore = ["RUF012", "SIM108", "B008", "T201", "RUF001", "RUF002", "RUF003"]
 "src/solana_sniper/app/doctor.py" = ["E501"]
 # embeds shell scripts for the mocked-launchd deployment test
 "tests/integration/test_scripts.py" = ["E501"]
+# real-clock end-to-end run against mocked live providers: polling with sleep is intended
+"tests/integration/test_live_pipeline_mocked.py" = ["E501", "ASYNC110"]
 
 [tool.mypy]
 python_version = "3.12"

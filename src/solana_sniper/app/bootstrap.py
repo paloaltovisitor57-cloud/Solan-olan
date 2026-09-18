@@ -10,11 +10,14 @@ import asyncio
 import contextlib
 import signal
 import uuid
-from collections.abc import Callable, Coroutine
+from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
+
+import httpx
+from websockets.asyncio.client import ClientConnection
 
 from solana_sniper.alerts.service import AlertService
 from solana_sniper.alerts.terminal import TerminalAlertProvider
@@ -200,7 +203,10 @@ def build_runtime(
     clock: Clock | None = None,
     synthetic_seed: int = 7,
     quiet_alerts: bool = False,
+    http_transport: httpx.AsyncBaseTransport | None = None,
+    ws_connect: Callable[[str], Awaitable[ClientConnection]] | None = None,
 ) -> Runtime:
+    """Build all components. `http_transport`/`ws_connect` let tests mock the live providers."""
     clock = clock or SystemClock()
     sid = session_id or new_session_id(mode)
     metrics = Metrics()
@@ -208,6 +214,7 @@ def build_runtime(
         timeout_s=settings.providers.http_timeout_s,
         max_connections=settings.providers.http_max_connections,
         metrics=metrics,
+        transport=http_transport,
     )
     bus = EventBus()
     repo = Repository(
@@ -298,6 +305,7 @@ def build_runtime(
                 metrics=metrics,
                 min_backoff_s=settings.providers.ws_reconnect_min_s,
                 max_backoff_s=settings.providers.ws_reconnect_max_s,
+                ws_connect=ws_connect,
             )
             background.append(("pumpportal-ws", pump.run))
             probes.append(pump)

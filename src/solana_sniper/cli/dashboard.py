@@ -101,7 +101,11 @@ class Dashboard:
             f"tick p50/p95 {lat['engine_tick'].summary().get('p50_ms', '-')}/"
             f"{lat['engine_tick'].summary().get('p95_ms', '-')}"
         )
-        title = f"solana-sniper {mode} session {e.session_id}"
+        basis = "simulated" if e.mode.value != "LIVE" else "quote-estimated / user-reported"
+        title = (
+            f"solana-sniper {mode} session {e.session_id}  "
+            f"[dim]figures are {basis}, not on-chain verified[/]"
+        )
         return Panel(
             Group(Text(line1), Text(line2), Text(line3), Text(line4, style="dim")), title=title
         )
@@ -178,7 +182,18 @@ class Dashboard:
     def _positions(self) -> Panel:
         e = self._engine
         table = Table(expand=True, show_edge=False, pad_edge=False)
-        for col in ("sym", "held", "cost", "value", "peak", "pnl", "dd/thr", "exec", "state"):
+        for col in (
+            "sym",
+            "held",
+            "cost",
+            "value",
+            "peak",
+            "pnl",
+            "dd/thr",
+            "exec",
+            "prov",
+            "state",
+        ):
             table.add_column(col, no_wrap=True)
         now = e.now()
         for p in e.open_positions():
@@ -194,9 +209,14 @@ class Dashboard:
                 Text(f"{_eur(p.unrealized_pnl_eur)} {p.pnl_pct:+.0%}", style=pnl_style),
                 f"{p.trailing_drawdown_pct:.0%}/{thr:.0%}",
                 "Q" if p.value_is_executable else ("stale" if p.data_stale else "px"),
+                str(p.provenance)[:4] + ("" if p.units_known else "/units?"),
                 str(cand.state) if cand else str(p.state),
             )
-        return Panel(table, title=f"OPEN POSITIONS ({len(e.open_positions())})")
+        return Panel(
+            table,
+            title=f"OPEN POSITIONS ({len(e.open_positions())})  prov: SIMU=simulated "
+            "ESTI=quote-estimated USER=user-reported; none on-chain verified",
+        )
 
     def _footer(self) -> Panel:
         lines: list[Text] = []

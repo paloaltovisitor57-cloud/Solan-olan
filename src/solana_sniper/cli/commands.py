@@ -69,7 +69,9 @@ class CommandHandler:
             elif cmd == "b":
                 ref = _ref(args)
                 if ref is None:
-                    self._say("usage: b N [sol_spent tokens_received [tx_signature]]")
+                    self._say(
+                        "usage: b N [sol_spent tokens_received_ui [tx_signature]] (recorded as user-reported, unverified)"
+                    )
                     return
                 override = _buy_override(args[1:])
                 self._say(await self._engine.confirm_buy(ref, override))
@@ -89,8 +91,8 @@ class CommandHandler:
             elif cmd == "p":
                 for p in self._engine.open_positions():
                     self._say(
-                        f"{p.symbol or p.mint[:8]} qty={p.quantity:,.0f} cost=€{p.cost_basis_eur:.2f} "
-                        f"value=€{p.current_value_eur:.2f} pnl={p.pnl_pct:+.0%}"
+                        f"{p.symbol or p.mint[:8]} qty={p.quantity_ui:,.0f} cost=€{p.cost_basis_eur:.2f} "
+                        f"value=€{p.current_value_eur:.2f} pnl={p.pnl_pct:+.0%} [{p.provenance}]"
                     )
                 if not self._engine.open_positions():
                     self._say("no open positions")
@@ -132,7 +134,7 @@ def _buy_override(rest: list[str]) -> FillOverride | None:
     sol = _parse_decimal(rest[0]) if len(rest) >= 1 else None
     tokens = _parse_decimal(rest[1]) if len(rest) >= 2 else None
     sig = rest[2] if len(rest) >= 3 else None
-    return FillOverride(sol_amount=sol, token_amount=tokens, tx_signature=sig)
+    return FillOverride(sol_amount=sol, token_amount_ui=tokens, reported_tx_signature=sig)
 
 
 def _sell_override(rest: list[str]) -> FillOverride | None:
@@ -140,4 +142,4 @@ def _sell_override(rest: list[str]) -> FillOverride | None:
         return None
     sol = _parse_decimal(rest[0]) if len(rest) >= 1 else None
     sig = rest[1] if len(rest) >= 2 else None
-    return FillOverride(sol_amount=sol, tx_signature=sig)
+    return FillOverride(sol_amount=sol, reported_tx_signature=sig)

@@ -94,6 +94,45 @@ class DecisionSource(StrEnum):
     SYSTEM = "SYSTEM"
 
 
+class FillProvenance(StrEnum):
+    """How a recorded fill came to exist. Nothing this software records is on-chain verified.
+
+    SIMULATED        dry-run auto-confirmation; no transaction ever existed
+    ESTIMATED        human confirmed, amounts taken from the quote (not from a wallet or chain)
+    USER_REPORTED    human confirmed and typed the amounts / signature they saw in their wallet
+    VERIFIED_ONCHAIN reserved for a future reconciliation adapter; never set by this software
+    UNKNOWN_LEGACY   record written before provenance existed; migration flags it, never upgrades it
+    """
+
+    SIMULATED = "SIMULATED"
+    ESTIMATED = "ESTIMATED"
+    USER_REPORTED = "USER_REPORTED"
+    VERIFIED_ONCHAIN = "VERIFIED_ONCHAIN"
+    UNKNOWN_LEGACY = "UNKNOWN_LEGACY"
+
+
+class TokenUnits(StrEnum):
+    """Which unit a recorded token quantity is in. UI = human units (10^-decimals)."""
+
+    UI = "UI"
+    UNKNOWN_LEGACY = "UNKNOWN_LEGACY"
+
+
+PROVENANCE_RANK = {
+    FillProvenance.SIMULATED: 0,
+    FillProvenance.UNKNOWN_LEGACY: 1,
+    FillProvenance.ESTIMATED: 2,
+    FillProvenance.USER_REPORTED: 3,
+    FillProvenance.VERIFIED_ONCHAIN: 4,
+}
+
+
+def weakest_provenance(*items: FillProvenance) -> FillProvenance:
+    """The least trustworthy of several provenances (a position is only as verified as its
+    weakest fill)."""
+    return min(items, key=lambda p: PROVENANCE_RANK[p]) if items else FillProvenance.UNKNOWN_LEGACY
+
+
 class LedgerEntryKind(StrEnum):
     DEPOSIT = "DEPOSIT"
     WITHDRAWAL = "WITHDRAWAL"

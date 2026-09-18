@@ -12,6 +12,7 @@ from solana_sniper.domain.models import TokenInfo
 from solana_sniper.infra.http import HttpClient, HttpError
 from solana_sniper.market_data.dexscreener import DexScreenerMarketData
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -41,7 +42,7 @@ class DexScreenerDiscovery:
         try:
             res = await self._http.get_json(f"{self._base}{path}")
         except HttpError as exc:
-            log.warning("dexscreener_profiles_failed", path=path, error=str(exc))
+            log.warning("dexscreener_profiles_failed", path=path, error=safe_exception(exc))
             return []
         mints: list[str] = []
         for item in as_list(res.json):

@@ -20,6 +20,7 @@ from solana_sniper.domain.enums import Venue
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo
 from solana_sniper.infra.http import HttpClient, HttpError
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -124,7 +125,7 @@ class DexScreenerMarketData:
             try:
                 res = await self._http.get_json(f"{self._base}/tokens/v1/solana/{','.join(chunk)}")
             except HttpError as exc:
-                log.warning("dexscreener_fetch_failed", count=len(chunk), error=str(exc))
+                log.warning("dexscreener_fetch_failed", count=len(chunk), error=safe_exception(exc))
                 continue
             views.extend(best_pairs(as_list(res.json), self._clock.now(), res.latency_ms))
         return views

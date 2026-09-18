@@ -16,13 +16,15 @@ from solana_sniper.domain.enums import (
     DecisionKind,
     DecisionSource,
     ExitReason,
+    FillProvenance,
     LedgerEntryKind,
     SignalKind,
     SignalStatus,
+    TokenUnits,
     Urgency,
     Venue,
 )
-from solana_sniper.domain.money import ZERO
+from solana_sniper.domain.money import ZERO, check_decimals, raw_to_ui
 
 
 def new_id(prefix: str) -> str:
@@ -362,6 +364,7 @@ class BuySignal:
     liquidity_usd: Decimal | None
     price_native: Decimal | None
     sol_eur: Decimal
+    token_decimals: int = 6
     kind: SignalKind = SignalKind.BUY
     urgency: Urgency = Urgency.NORMAL
     session_id: str = ""
@@ -398,6 +401,8 @@ class SellSignal:
     exit_quote: SwapQuote | None
     estimated_sell_output_sol: Decimal | None
     sol_eur: Decimal
+    quantity_ui: Decimal = ZERO
+    token_decimals: int = 6
     kind: SignalKind = SignalKind.SELL
     session_id: str = ""
 
@@ -416,7 +421,12 @@ class ManualDecision:
 class Fill:
     """A confirmed (or simulated) fill.
 
-    Never produced by broadcasting a transaction; it records what the user confirmed they did.
+    Never produced by broadcasting a transaction. `provenance` says where the numbers came from
+    and `verified_onchain` is always False in this software: a reported signature string is stored
+    as-is and is *not* evidence that the transaction exists or matches these amounts.
+
+    Token quantities carry both representations, derived from each other with `token_decimals`:
+    `token_amount_ui` (human units) and `token_amount_raw` (integer base units).
     """
 
     fill_id: str
@@ -425,14 +435,37 @@ class Fill:
     side: SignalKind
     filled_at: datetime
     sol_amount: Decimal  # SOL spent (buy) or received (sell)
-    token_amount: Decimal  # tokens received (buy) or sold (sell)
+    token_amount_ui: Decimal  # tokens received (buy) or sold (sell), UI units
+    token_amount_raw: int  # same quantity in base units (10^-decimals)
+    token_decimals: int
     eur_amount: Decimal
     sol_eur: Decimal
     fee_eur: Decimal
     slippage_cost_eur: Decimal
+    provenance: FillProvenance
     simulated: bool
-    tx_signature: str | None = None
+    units: TokenUnits = TokenUnits.UI
+    reported_tx_signature: str | None = None  # user-supplied text, unverified
+    verified_onchain: bool = False  # reserved; this software never sets it
     note: str = ""
+
+    def __post_init__(self) -> None:
+        if self.simulated != (self.provenance is FillProvenance.SIMULATED):
+            raise ValueError("Fill.simulated must agree with provenance")
+        if self.verified_onchain:
+            raise ValueError(
+                "Fill.verified_onchain cannot be set: no on-chain reconciliation exists"
+            )
+        if self.units is TokenUnits.UI:
+            check_decimals(self.token_decimals)
+            if self.token_amount_ui < 0 or self.token_amount_raw < 0:
+                raise ValueError("token amounts cannot be negative")
+            if raw_to_ui(self.token_amount_raw, self.token_decimals) != self.token_amount_ui:
+                raise ValueError("token_amount_ui and token_amount_raw disagree for token_decimals")
+
+    @property
+    def is_verified(self) -> bool:
+        return False
 
 
 @dataclass(slots=True)
@@ -443,9 +476,13 @@ class Position:
     opened_at: datetime
     entry_price_native: Decimal
     entry_sol_eur: Decimal
-    quantity: Decimal
+    quantity_ui: Decimal  # tokens held, UI units
     cost_basis_eur: Decimal
     entry_sol: Decimal
+    quantity_raw: int = 0  # same quantity in base units
+    token_decimals: int = 0
+    units: TokenUnits = TokenUnits.UNKNOWN_LEGACY  # set to UI by the accounting layer
+    provenance: FillProvenance = FillProvenance.UNKNOWN_LEGACY  # weakest of entry/exit fills
     entry_fee_eur: Decimal = ZERO
     entry_slippage_eur: Decimal = ZERO
     peak_value_eur: Decimal = ZERO
@@ -468,6 +505,15 @@ class Position:
     entry_signal_id: str | None = None
     exit_signal_id: str | None = None
     data_stale: bool = False
+
+    @property
+    def is_verified(self) -> bool:
+        """Always False: no fill recorded by this software is reconciled against the chain."""
+        return False
+
+    @property
+    def units_known(self) -> bool:
+        return self.units is TokenUnits.UI
 
     @property
     def is_open(self) -> bool:
@@ -527,6 +573,7 @@ class LedgerEntry:
     slippage_eur: Decimal = ZERO
     realized_pnl_eur: Decimal = ZERO
     reference_id: str | None = None
+    provenance: FillProvenance = FillProvenance.UNKNOWN_LEGACY
 
 
 @dataclass(frozen=True, slots=True)

@@ -14,6 +14,7 @@ from websockets.asyncio.client import ClientConnection
 from solana_sniper.infra.backoff import Backoff
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -73,7 +74,10 @@ class ReconnectingWebSocket:
             except Exception as exc:
                 delay = self._backoff.next_delay()
                 log.warning(
-                    "ws_connect_failed", ws=self.name, error=str(exc), retry_in_s=round(delay, 1)
+                    "ws_connect_failed",
+                    ws=self.name,
+                    error=safe_exception(exc),
+                    retry_in_s=round(delay, 1),
                 )
                 if self._metrics:
                     self._metrics.inc("provider_errors")
@@ -101,7 +105,7 @@ class ReconnectingWebSocket:
                 await self._close_quietly(conn)
                 raise
             except Exception as exc:
-                log.warning("ws_disconnected", ws=self.name, error=f"{type(exc).__name__}: {exc}")
+                log.warning("ws_disconnected", ws=self.name, error=safe_exception(exc))
             finally:
                 self.connected.clear()
                 self._conn = None

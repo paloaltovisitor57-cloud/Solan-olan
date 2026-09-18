@@ -24,7 +24,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from solana_sniper.domain.enums import Venue
+from solana_sniper.domain.enums import FillProvenance, Venue
 from solana_sniper.domain.models import (
     BuySignal,
     CheckReport,
@@ -69,6 +69,7 @@ from solana_sniper.storage.models import (
 from solana_sniper.storage.serialization import dataclass_from_dict, to_jsonable
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -140,6 +141,10 @@ class Repository:
                 await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
                 await conn.exec_driver_sql("PRAGMA synchronous=NORMAL")
             await conn.run_sync(Base.metadata.create_all)
+        # Apply pending schema/policy migrations so legacy rows are flagged before use.
+        from solana_sniper.storage.migrations import run_migrations
+
+        await run_migrations(self._engine)
 
     def start(self) -> None:
         if self._task is None:
@@ -192,8 +197,10 @@ class Repository:
                 return
             except SQLAlchemyError as exc:
                 self.failures += 1
-                self.last_flush_error = str(exc)[:200]
-                log.error("storage_batch_failed", attempt=attempt, ops=len(ops), error=str(exc))
+                self.last_flush_error = safe_exception(exc)[:200]
+                log.error(
+                    "storage_batch_failed", attempt=attempt, ops=len(ops), error=safe_exception(exc)
+                )
                 await asyncio.sleep(0.2)
         # second failure: try ops individually so one bad row does not poison the batch
         for op in ops:
@@ -203,7 +210,7 @@ class Repository:
                     await session.commit()
             except SQLAlchemyError as exc:
                 self.dropped += 1
-                log.error("storage_op_dropped", error=str(exc))
+                log.error("storage_op_dropped", error=safe_exception(exc))
 
     @property
     def queue_size(self) -> int:
@@ -455,6 +462,7 @@ class Repository:
                     slippage_eur=str(e.slippage_eur),
                     realized_pnl_eur=str(e.realized_pnl_eur),
                     reference_id=e.reference_id,
+                    provenance=str(e.provenance),
                 )
             )
 
@@ -617,6 +625,7 @@ class Repository:
                 slippage_eur=Decimal(r.slippage_eur),
                 realized_pnl_eur=Decimal(r.realized_pnl_eur),
                 reference_id=r.reference_id,
+                provenance=_provenance_of(r.provenance),
             )
             for r in ledger_rows
         ]
@@ -909,6 +918,12 @@ class Repository:
             ):
                 out[name] = len((await s.execute(select(model))).scalars().all())
         return out
+
+
+def _provenance_of(value: str | None) -> FillProvenance:
+    if value is None or value not in FillProvenance.__members__:
+        return FillProvenance.UNKNOWN_LEGACY
+    return FillProvenance(value)
 
 
 def _aware(dt: datetime) -> datetime:

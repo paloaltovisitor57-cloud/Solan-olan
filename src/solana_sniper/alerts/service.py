@@ -88,8 +88,8 @@ class AlertService:
             return Alert(
                 at=p.opened_at,
                 title=f"OPENED {p.symbol or p.mint[:6]}",
-                body=f"qty {p.quantity:,.0f} cost €{q_display(p.cost_basis_eur)}"
-                + (" (simulated)" if p.simulated else ""),
+                body=f"qty {p.quantity_ui:,.0f} cost €{q_display(p.cost_basis_eur)} "
+                f"[{p.provenance}, unverified]",
                 urgency=Urgency.NORMAL,
                 category="position",
             )
@@ -101,7 +101,8 @@ class AlertService:
             return Alert(
                 at=p.closed_at or p.opened_at,
                 title=f"CLOSED {p.symbol or p.mint[:6]} {sign}€{q_display(pnl)}",
-                body=f"exit €{q_display(exit_value)} ({p.exit_reason}) pnl {p.pnl_pct:+.0%}",
+                body=f"exit €{q_display(exit_value)} ({p.exit_reason}) pnl {p.pnl_pct:+.0%} "
+                f"[{p.provenance}, unverified]",
                 urgency=Urgency.NORMAL,
                 category="position",
             )

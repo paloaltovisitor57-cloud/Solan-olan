@@ -23,6 +23,7 @@ from solana_sniper.domain.models import TokenInfo, TradeEvent
 from solana_sniper.infra.websocket import ReconnectingWebSocket
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -174,7 +175,7 @@ class PumpPortalClient:
         try:
             await self._ws.send_json(payload)
         except Exception as exc:
-            log.warning("pumpportal_send_failed", error=str(exc))
+            log.warning("pumpportal_send_failed", error=safe_exception(exc))
 
     async def _resubscribe(self, ws: ReconnectingWebSocket) -> None:
         if self._want_new_tokens:

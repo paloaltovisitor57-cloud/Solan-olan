@@ -12,15 +12,26 @@ import httpx
 from solana_sniper.infra.backoff import Backoff
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_url, scrub_text
 
 log = get_logger(__name__)
 
 
 class HttpError(Exception):
-    def __init__(self, message: str, status: int | None = None, retryable: bool = False) -> None:
-        super().__init__(message)
+    """Transport/HTTP failure. The message never contains query strings, userinfo, headers or
+    response bodies: only the method, a sanitised endpoint, the status and the error type."""
+
+    def __init__(
+        self,
+        message: str,
+        status: int | None = None,
+        retryable: bool = False,
+        endpoint: str | None = None,
+    ) -> None:
+        super().__init__(scrub_text(message))
         self.status = status
         self.retryable = retryable
+        self.endpoint = endpoint
 
 
 class RateLimitedError(HttpError):
@@ -129,6 +140,7 @@ class HttpClient:
         timeout_s: float | None,
     ) -> HttpResult:
         host = httpx.URL(url).host
+        endpoint = safe_url(url)
         bucket = self._buckets.get(host)
         backoff = Backoff(minimum=0.5, maximum=8.0)
         last_error: Exception | None = None
@@ -147,7 +159,9 @@ class HttpClient:
                 )
             except httpx.TransportError as exc:  # timeouts, network, proxy, protocol errors
                 last_error = HttpError(
-                    f"{method} {url}: {type(exc).__name__}: {exc}", retryable=True
+                    f"{method} {endpoint}: {type(exc).__name__}: {scrub_text(str(exc))}",
+                    retryable=True,
+                    endpoint=endpoint,
                 )
                 if self._metrics:
                     self._metrics.inc("provider_errors")
@@ -162,7 +176,7 @@ class HttpClient:
                 if self._metrics:
                     self._metrics.inc("rate_limited")
                 retry_after = _parse_retry_after(response.headers.get("retry-after"))
-                last_error = RateLimitedError(f"{host} rate limited", retry_after_s=retry_after)
+                last_error = RateLimitedError(f"{endpoint} rate limited", retry_after_s=retry_after)
                 if attempt < retries:
                     await asyncio.sleep(
                         retry_after if retry_after is not None else backoff.next_delay()
@@ -171,9 +185,10 @@ class HttpClient:
                 raise last_error
             if response.status_code >= 500:
                 last_error = HttpError(
-                    f"{method} {url}: HTTP {response.status_code}",
+                    f"{method} {endpoint}: HTTP {response.status_code}",
                     status=response.status_code,
                     retryable=True,
+                    endpoint=endpoint,
                 )
                 if self._metrics:
                     self._metrics.inc("provider_errors")
@@ -182,14 +197,18 @@ class HttpClient:
                     continue
                 raise last_error
             if response.status_code >= 400:
+                # Response bodies are never included: providers may echo the request (and its key).
                 raise HttpError(
-                    f"{method} {url}: HTTP {response.status_code}: {response.text[:200]}",
+                    f"{method} {endpoint}: HTTP {response.status_code}",
                     status=response.status_code,
+                    endpoint=endpoint,
                 )
             try:
                 payload = response.json()
             except ValueError as exc:
-                raise MalformedResponseError(f"{method} {url}: invalid JSON") from exc
+                raise MalformedResponseError(
+                    f"{method} {endpoint}: invalid JSON", endpoint=endpoint
+                ) from exc
             return HttpResult(
                 status=response.status_code,
                 json=payload,

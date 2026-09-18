@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Any, Protocol
 from solana_sniper.domain.enums import CandidateState as S
 from solana_sniper.domain.money import q_display
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import safe_url, scrub_text
 
 if TYPE_CHECKING:
     from solana_sniper.app.bootstrap import Runtime
@@ -94,6 +95,9 @@ class HealthReporter:
                 "held_s": round(p.holding_seconds(now)),
                 "executable_value": p.value_is_executable,
                 "data_stale": p.data_stale,
+                "provenance": str(p.provenance),
+                "units": str(p.units),
+                "verified_onchain": False,
             }
             for p in rt.account.open_positions
         ]
@@ -112,6 +116,7 @@ class HealthReporter:
             "started_at": engine.started_at.isoformat() if engine.started_at else None,
             "uptime_s": _age(now, engine.started_at),
             "healthy": healthy,
+            "records_verified_onchain": False,  # this software never reconciles fills on-chain
             "engine": {
                 "last_tick_age_s": last_tick_age,
                 "tick_p50_ms": tick_summary.get("p50_ms"),
@@ -129,10 +134,10 @@ class HealthReporter:
                 "discovery_rate_per_s": round(rt.metrics.discovery_rate_per_s(), 3),
             },
             "database": {
-                "url": rt.settings.storage.database_url,
+                "url": safe_url(rt.settings.storage.database_url),
                 "ok": db_ok,
                 "last_flush_age_s": _age(wall, db.last_flush_at),
-                "last_error": db.last_flush_error,
+                "last_error": scrub_text(db.last_flush_error) if db.last_flush_error else None,
                 "failures": db.failures,
                 "dropped": db.dropped,
                 "queued": db.queue_size,

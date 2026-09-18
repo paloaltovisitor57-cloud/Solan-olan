@@ -42,12 +42,38 @@ def sol_to_lamports(sol: Decimal) -> int:
     return int((sol * LAMPORTS_PER_SOL).to_integral_value(rounding=ROUND_DOWN))
 
 
+MAX_TOKEN_DECIMALS = 18
+
+
+class UnitError(ValueError):
+    """Invalid decimals, or a UI amount not representable exactly in raw units."""
+
+
+def check_decimals(decimals: int) -> int:
+    if isinstance(decimals, bool) or not isinstance(decimals, int):
+        raise UnitError("token decimals must be an integer")
+    if decimals < 0 or decimals > MAX_TOKEN_DECIMALS:
+        raise UnitError(f"token decimals out of range: {decimals}")
+    return decimals
+
+
 def raw_to_ui(raw: int, decimals: int) -> Decimal:
-    return Decimal(raw) / (Decimal(10) ** decimals)
+    """Exact: raw / 10**decimals (Decimal division by a power of ten never rounds)."""
+    check_decimals(decimals)
+    if raw < 0:
+        raise UnitError("raw token amount cannot be negative")
+    return Decimal(raw).scaleb(-decimals)
 
 
-def ui_to_raw(ui: Decimal, decimals: int) -> int:
-    return int((ui * (Decimal(10) ** decimals)).to_integral_value(rounding=ROUND_DOWN))
+def ui_to_raw(ui: Decimal, decimals: int, *, exact: bool = False) -> int:
+    """UI amount -> raw integer. Rounds down unless exact=True, which raises on any remainder."""
+    check_decimals(decimals)
+    if ui < 0:
+        raise UnitError("UI token amount cannot be negative")
+    scaled = ui.scaleb(decimals)
+    if exact and scaled != scaled.to_integral_value():
+        raise UnitError("UI amount is not representable in raw units at the given decimals")
+    return int(scaled.to_integral_value(rounding=ROUND_DOWN))
 
 
 def pct(numerator: Decimal, denominator: Decimal) -> Decimal:

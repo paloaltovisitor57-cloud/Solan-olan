@@ -116,7 +116,7 @@ async def test_manual_confirm_and_reject(clock: ManualClock) -> None:
         await ex.submit_buy(sig)  # duplicate pending buy for the same mint
     res = await ex.decide(order, DecisionKind.CONFIRM, DecisionSource.HUMAN)
     assert res.fill is not None and res.decision.kind is DecisionKind.CONFIRM
-    assert res.fill.sol_amount == Decimal("0.1") and res.fill.token_amount == Decimal("1000")
+    assert res.fill.sol_amount == Decimal("0.1") and res.fill.token_amount_ui == Decimal("1000")
     assert res.fill.eur_amount == Decimal("15") and not res.fill.simulated
     assert res.fill.slippage_cost_eur == Decimal("0.1") * Decimal("0.015") * Decimal("150")
     assert order.status is SignalStatus.CONFIRMED and ex.pending() == []
@@ -138,15 +138,15 @@ async def test_override_amounts_and_sell_fill(clock: ManualClock) -> None:
         DecisionKind.CONFIRM,
         DecisionSource.HUMAN,
         override=FillOverride(
-            sol_amount=Decimal("0.12"), token_amount=Decimal("900"), tx_signature="5abc"
+            sol_amount=Decimal("0.12"), token_amount_ui=Decimal("900"), reported_tx_signature="5abc"
         ),
     )
     assert (
         res.fill is not None
         and res.fill.sol_amount == Decimal("0.12")
-        and res.fill.token_amount == Decimal("900")
+        and res.fill.token_amount_ui == Decimal("900")
     )
-    assert res.fill.tx_signature == "5abc"
+    assert res.fill.reported_tx_signature == "5abc" and not res.fill.verified_onchain
     sell = await ex.submit_sell(make_sell_signal(clock))
     res_s = await ex.decide(sell, DecisionKind.CONFIRM, DecisionSource.HUMAN)
     assert res_s.fill is not None and res_s.fill.side is SignalKind.SELL
@@ -194,7 +194,7 @@ async def test_dry_run_auto_confirms_with_haircut(clock: ManualClock) -> None:
     results = await ex.auto_confirm(clock.now())
     assert len(results) == 1 and results[0].order is buy
     fill = results[0].fill
-    assert fill is not None and fill.simulated and fill.token_amount == Decimal("990")
+    assert fill is not None and fill.simulated and fill.token_amount_ui == Decimal("990")
     assert fill.eur_amount == Decimal("15")
     assert results[0].decision.source is DecisionSource.DRY_RUN
     assert ex.pending() == [sell]  # sells not auto-confirmed in this configuration

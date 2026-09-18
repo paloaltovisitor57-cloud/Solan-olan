@@ -1,4 +1,9 @@
-"""Structured logging via structlog. Console renderer for humans, JSON for machines."""
+"""Structured logging via structlog. Console renderer for humans, JSON for machines.
+
+Every sink scrubs credentials: structlog events pass through `scrub_event`, and each stdlib
+handler gets a `ScrubbingFormatter` plus a `ScrubbingFilter` (so third-party loggers such as
+httpx/websockets are covered too).
+"""
 
 from __future__ import annotations
 
@@ -8,6 +13,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 import structlog
+
+from solana_sniper.telemetry.redaction import (
+    ScrubbingFilter,
+    ScrubbingFormatter,
+    install_record_factory,
+    scrub_event,
+)
 
 _CONFIGURED = False
 
@@ -20,6 +32,7 @@ def configure_logging(
 ) -> None:
     """Configure stdlib + structlog once. quiet_console is used while the dashboard owns the TTY."""
     global _CONFIGURED
+    install_record_factory()
     handlers: list[logging.Handler] = []
     if not quiet_console:
         handlers.append(logging.StreamHandler(sys.stderr))
@@ -34,6 +47,8 @@ def configure_logging(
     for h in list(root.handlers):
         root.removeHandler(h)
     for h in handlers:
+        h.setFormatter(ScrubbingFormatter("%(message)s"))
+        h.addFilter(ScrubbingFilter())
         root.addHandler(h)
     root.setLevel(level.upper())
     for noisy in ("httpx", "httpcore", "websockets", "sqlalchemy.engine", "aiosqlite"):
@@ -52,6 +67,7 @@ def configure_logging(
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
+            scrub_event,
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(logging.getLevelName(level.upper())),

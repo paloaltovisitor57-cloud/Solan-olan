@@ -28,6 +28,7 @@ from solana_sniper.domain.enums import (
     SignalKind,
     SignalStatus,
     Urgency,
+    Venue,
 )
 from solana_sniper.domain.events import (
     BuySignalCreated,
@@ -95,6 +96,7 @@ from solana_sniper.strategy.gate import EntryGate
 from solana_sniper.strategy.scoring import EntryScorer
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics, PipelineTimer
+from solana_sniper.telemetry.redaction import safe_exception, scrub_text
 from solana_sniper.token_analysis.base import LiquidityProvider, TokenMetadataProvider
 
 log = get_logger(__name__)
@@ -227,12 +229,13 @@ class Engine:
         self.d.bus.publish(LogLine(at=now, level=level, message=message))
 
     def _error(self, component: str, exc: BaseException | str, detail: str = "") -> None:
-        message = str(exc)
+        message = safe_exception(exc) if isinstance(exc, BaseException) else scrub_text(str(exc))
+        raw_detail = detail or (traceback.format_exc() if isinstance(exc, BaseException) else "")
         rec = ErrorRecord(
             at=self.now(),
             component=component,
             message=message,
-            detail=detail or (traceback.format_exc() if isinstance(exc, BaseException) else ""),
+            detail=scrub_text(raw_detail),
             session_id=self.session_id,
         )
         log.error("engine_error", component=component, error=message)
@@ -455,6 +458,14 @@ class Engine:
         elif cand.state is S.QUALIFIED:
             self._transition(cand, S.MONITORING, "; ".join(decision.reasons)[:120])
 
+    def _token_decimals(self, cand: Candidate) -> int | None:
+        """Decimals from discovery metadata or the mint account; None until known, never guessed."""
+        if cand.track.token.decimals is not None:
+            return cand.track.token.decimals
+        if cand.track.authorities is not None:
+            return cand.track.authorities.decimals
+        return None
+
     def _rt_fresh(self, rt: RoundTripQuote, now: datetime) -> bool:
         return (now - rt.quoted_at).total_seconds() <= self.settings.quotes.max_quote_age_s
 
@@ -521,6 +532,10 @@ class Engine:
         if len(self.d.execution.pending()) >= self.settings.entry.max_pending_signals:
             cand.gate_reasons = ("max pending signals reached",)
             return
+        if self._token_decimals(cand) is None:
+            cand.gate_reasons = ("token decimals unknown (waiting for mint metadata)",)
+            cand.next_quote_at = now + timedelta(seconds=2)
+            return
         sizing = self._size(cand, features)
         if sizing.recommended_eur <= 0:
             cand.gate_reasons = tuple(f"sizing: {c}" for c in sizing.caps_applied) or (
@@ -578,7 +593,10 @@ class Engine:
         self, cand: Candidate, spend_sol: Decimal, size_eur: Decimal
     ) -> None:
         cfg = self.settings
-        decimals = cand.track.token.decimals if cand.track.token.decimals is not None else 6
+        decimals = self._token_decimals(cand)
+        if decimals is None:
+            cand.gate_reasons = ("token decimals unknown (waiting for mint metadata)",)
+            return
         try:
             rt = await self.d.round_trip.evaluate(cand.mint, spend_sol, decimals)
         except QuoteError as exc:
@@ -689,6 +707,7 @@ class Engine:
             if features.price_native is not None
             else None,
             sol_eur=sol_eur,
+            token_decimals=decimals,
             urgency=Urgency.HIGH if score.score >= 85 else Urgency.NORMAL,
             session_id=self.session_id,
         )
@@ -797,7 +816,7 @@ class Engine:
         assert res.fill is not None and res.order.buy is not None
         fill = res.fill
         sig = res.order.buy
-        entry_price = (fill.sol_amount / fill.token_amount) if fill.token_amount > 0 else ZERO
+        entry_price = (fill.sol_amount / fill.token_amount_ui) if fill.token_amount_ui > 0 else ZERO
         try:
             position = self.d.account.open_position(
                 fill,
@@ -821,10 +840,12 @@ class Engine:
             cand.position_id = position.position_id
             cand.order = None
             if cand.state is S.AWAITING_CONFIRMATION:
-                self._transition(cand, S.OPEN, f"filled {fill.token_amount:,.0f} @ {entry_price}")
+                self._transition(
+                    cand, S.OPEN, f"filled {fill.token_amount_ui:,.0f} @ {entry_price}"
+                )
         self._log_event(
-            f"OPEN {sig.symbol or sig.mint[:8]} qty={fill.token_amount:,.0f} "
-            f"cost=€{position.cost_basis_eur:.2f}" + (" [simulated]" if fill.simulated else ""),
+            f"OPEN {sig.symbol or sig.mint[:8]} qty={fill.token_amount_ui:,.0f} "
+            f"cost=€{position.cost_basis_eur:.2f} [{fill.provenance}]",
             "WARN",
         )
         await self._after_portfolio_change()
@@ -911,7 +932,7 @@ class Engine:
             cand.exit_quote is None
             or (now - cand.exit_quote.quoted_at).total_seconds() >= cfg.quotes.refresh_interval_s
         )
-        if need_quote and not cand.exit_quote_in_flight:
+        if need_quote and not cand.exit_quote_in_flight and position.units_known:
             cand.exit_quote_in_flight = True
             self._spawn(self._refresh_exit_quote(cand, position), f"exitq-{cand.mint[:6]}")
         latest = track.latest
@@ -962,6 +983,8 @@ class Engine:
             exit_quote=exit_quote,
             estimated_sell_output_sol=est_out,
             sol_eur=sol_eur,
+            quantity_ui=position.quantity_ui,
+            token_decimals=position.token_decimals,
             session_id=self.session_id,
         )
         if not self._transition(cand, S.EXIT_SIGNAL, f"{decision.reason}: {decision.detail}"[:160]):
@@ -992,13 +1015,14 @@ class Engine:
     async def _refresh_exit_quote(self, cand: Candidate, position: Position) -> None:
         try:
             async with self._quote_sem:
-                decimals = cand.track.token.decimals if cand.track.token.decimals is not None else 6
-                quote = await self.d.round_trip.exit_quote(cand.mint, position.quantity, decimals)
+                quote = await self.d.round_trip.exit_quote(
+                    cand.mint, position.quantity_ui, position.token_decimals
+                )
             cand.exit_quote = quote
             self.d.bus.publish(QuoteObtained(quote))
         except QuoteError as exc:
             self.d.metrics.inc("quote_failures")
-            log.debug("exit_quote_failed", mint=cand.mint, error=str(exc))
+            log.debug("exit_quote_failed", mint=cand.mint, error=safe_exception(exc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -1076,31 +1100,27 @@ class Engine:
         max_age = self.settings.quotes.max_quote_age_s
         if signal.quote.buy.is_fresh(self.now(), max_age):
             return None, ""
-        decimals = (
-            cand.track.token.decimals if cand and cand.track.token.decimals is not None else 6
-        )
+        decimals = signal.token_decimals
         try:
             async with self._quote_sem:
                 rt = await self.d.round_trip.evaluate(signal.mint, signal.quote.spend_sol, decimals)
         except QuoteError as exc:
             return None, f"booked at signal quote; re-quote failed: {exc}"
         self.d.bus.publish(QuoteObtained(rt.buy))
-        return FillOverride(token_amount=rt.expected_tokens_ui), "booked at fresh quote"
+        return FillOverride(token_amount_ui=rt.expected_tokens_ui), "booked at fresh quote"
 
     async def _fresh_sell_override(self, signal: SellSignal) -> tuple[FillOverride | None, str]:
         max_age = self.settings.quotes.max_quote_age_s
         if signal.exit_quote is not None and signal.exit_quote.is_fresh(self.now(), max_age):
             return None, ""
         position = self.d.account.positions.get(signal.position_id)
-        cand = self.candidates.get(signal.mint)
-        if position is None:
-            return None, ""
-        decimals = (
-            cand.track.token.decimals if cand and cand.track.token.decimals is not None else 6
-        )
+        if position is None or not position.units_known:
+            return None, "" if position is None else "legacy record: units unverified, no re-quote"
         try:
             async with self._quote_sem:
-                quote = await self.d.round_trip.exit_quote(signal.mint, position.quantity, decimals)
+                quote = await self.d.round_trip.exit_quote(
+                    signal.mint, position.quantity_ui, position.token_decimals
+                )
         except QuoteError as exc:
             return None, f"booked at signal quote; re-quote failed: {exc}"
         self.d.bus.publish(QuoteObtained(quote))
@@ -1146,11 +1166,20 @@ class Engine:
                 cand = self.candidates[position.mint]
             else:
                 stored = await self.d.repo.get_token(position.mint)
-                token = stored or TokenInfo(
-                    mint=position.mint, symbol=position.symbol, source="recovered", decimals=6
+                decimals = position.token_decimals if position.units_known else None
+                if decimals is None and stored is not None:
+                    decimals = stored.decimals
+                token = TokenInfo(
+                    mint=position.mint,
+                    symbol=position.symbol or (stored.symbol if stored else None),
+                    name=stored.name if stored else None,
+                    decimals=decimals,
+                    pool_created_at=stored.pool_created_at if stored else None,
+                    venue=stored.venue if stored else Venue.UNKNOWN,
+                    pool_address=stored.pool_address if stored else None,
+                    quote_mint=stored.quote_mint if stored else None,
+                    source="recovered",
                 )
-                if stored is not None and stored.decimals is None:
-                    token = TokenInfo(**{**stored.__dict__, "decimals": 6})
                 track = self.d.tracker.track(token)
                 cand = Candidate(
                     track=track, sm=CandidateStateMachine(position.mint), discovered_at=self.now()
@@ -1165,9 +1194,10 @@ class Engine:
                 position.state = (
                     S.OPEN
                 )  # pending exit signals do not survive restarts; re-evaluate live
+            units = "units UI" if position.units_known else "UNITS UNVERIFIED (legacy record)"
             self._log_event(
                 f"restored open position {position.symbol or position.mint[:8]} "
-                f"cost=€{position.cost_basis_eur:.2f}",
+                f"cost=€{position.cost_basis_eur:.2f} [{position.provenance}, {units}]",
                 "WARN",
             )
 

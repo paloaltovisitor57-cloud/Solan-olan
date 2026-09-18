@@ -32,14 +32,14 @@ def test_serialization_roundtrip(clock: ManualClock) -> None:
         opened_at=clock.now(),
         entry_price_native=Decimal("0.0001"),
         entry_sol_eur=Decimal("150"),
-        quantity=Decimal("1000.5"),
+        quantity_ui=Decimal("1000.5"),
         cost_basis_eur=Decimal("20.25"),
         entry_sol=Decimal("0.135"),
         exit_reason=ExitReason.TIMEOUT,
         state=CandidateState.OPEN,
     )
     data = to_jsonable(pos)
-    assert data["quantity"] == {"__dec__": "1000.5"}
+    assert data["quantity_ui"] == {"__dec__": "1000.5"}
     assert data["exit_reason"] == "TIMEOUT"
     back = dataclass_from_dict(Position, data)
     assert back == pos
@@ -202,7 +202,7 @@ async def test_restart_recovery_rebuilds_portfolio(repo: Repository, clock: Manu
     assert (
         rp.position_id == pos.position_id
         and rp.peak_value_eur == Decimal("30")
-        and rp.quantity == pos.quantity
+        and rp.quantity_ui == pos.quantity_ui
     )
     assert restored.equity == Decimal("59.5") and restored.peak_equity == Decimal("59.5")
     assert state.milestones_reached == [Decimal(50)]

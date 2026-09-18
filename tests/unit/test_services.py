@@ -126,7 +126,7 @@ async def test_market_service_batches_with_priority(clock: ManualClock) -> None:
 
     priority = ["c"]
     svc = MarketDataService(
-        MarketDataConfig(poll_interval_s=0.01),
+        MarketDataConfig(poll_interval_s=0.05),
         clock,
         Metrics(),
         emit_snapshot=es,

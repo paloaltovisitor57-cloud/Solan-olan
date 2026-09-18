@@ -46,12 +46,12 @@ class PositionMonitor:
         if exit_quote is not None and exit_quote.is_fresh(now, max_quote_age_s):
             sol_out = lamports_to_sol(exit_quote.out_amount_raw)
             value = q_eur(sol_out * sol_eur)
-            price = (sol_out / position.quantity) if position.quantity > 0 else Decimal(0)
+            price = (sol_out / position.quantity_ui) if position.quantity_ui > 0 else Decimal(0)
             return self._account.mark_position(
                 position.position_id, value_eur=value, price_native=price, at=now, executable=True
             )
         if price_native is not None:
-            value = q_eur(price_native * position.quantity * sol_eur)
+            value = q_eur(price_native * position.quantity_ui * sol_eur)
             return self._account.mark_position(
                 position.position_id,
                 value_eur=value,

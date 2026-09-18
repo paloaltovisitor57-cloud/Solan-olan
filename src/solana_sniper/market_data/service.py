@@ -15,6 +15,7 @@ from solana_sniper.market_data.base import (
 )
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -113,7 +114,9 @@ class MarketDataService:
                     raise
                 except Exception as exc:
                     self._metrics.inc("provider_errors")
-                    log.warning("market_poll_error", provider=provider.name, error=str(exc))
+                    log.warning(
+                        "market_poll_error", provider=provider.name, error=safe_exception(exc)
+                    )
                     return
             if snaps:
                 self._last_success_at = datetime.now(tz=UTC)

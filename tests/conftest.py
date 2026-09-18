@@ -7,8 +7,9 @@ import pytest
 
 from solana_sniper.config.settings import Settings
 from solana_sniper.domain.clock import ManualClock
-from solana_sniper.domain.enums import SignalKind
+from solana_sniper.domain.enums import FillProvenance, SignalKind
 from solana_sniper.domain.models import Fill, new_id
+from solana_sniper.domain.money import ui_to_raw
 from solana_sniper.portfolio.accounting import PortfolioAccount
 
 
@@ -41,7 +42,11 @@ def make_fill(
     fee_eur: Decimal = Decimal("0.05"),
     slippage_eur: Decimal = Decimal("0.10"),
     signal_id: str | None = None,
+    decimals: int = 6,
+    provenance: FillProvenance = FillProvenance.SIMULATED,
 ) -> Fill:
+    """Test fill; `token_amount` is in UI units and converted exactly to raw at `decimals`."""
+    raw = ui_to_raw(token_amount, decimals, exact=True)
     return Fill(
         fill_id=new_id("fill"),
         signal_id=signal_id or new_id("sig"),
@@ -49,10 +54,13 @@ def make_fill(
         side=side,
         filled_at=clock.now(),
         sol_amount=sol_amount,
-        token_amount=token_amount,
+        token_amount_ui=token_amount,
+        token_amount_raw=raw,
+        token_decimals=decimals,
         eur_amount=eur_amount,
         sol_eur=sol_eur,
         fee_eur=fee_eur,
         slippage_cost_eur=slippage_eur,
-        simulated=True,
+        provenance=provenance,
+        simulated=provenance is FillProvenance.SIMULATED,
     )

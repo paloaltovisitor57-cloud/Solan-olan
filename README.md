@@ -11,6 +11,19 @@ terminal dashboard, SQLite persistence with restart recovery, replay and a `doct
 > with `b N` / `s N`. Where enabled, it can prepare an **unsigned** Jupiter swap transaction for the
 > configured **public** key so the user can sign it in their own wallet. Invariant tests grep the
 > source tree for signing/broadcast code paths and fail if any appear.
+>
+> **Provenance of every figure.** Nothing this software records is reconciled against the chain.
+> Each fill, position and ledger entry carries a `provenance`: `SIMULATED` (dry-run),
+> `ESTIMATED` (a human confirmed and the amounts were taken from the quote), `USER_REPORTED` (the
+> human typed the amounts / a signature string they saw in their wallet) or `UNKNOWN_LEGACY`
+> (recorded before provenance existed). A reported signature is stored verbatim and is **not**
+> treated as verification; `verified_onchain` is always `false`. Dashboard, `positions`,
+> `portfolio`, `status` and the heartbeat all say so.
+>
+> **Software tests are not investment evidence.** The test suite proves that the pipeline, the
+> accounting and the safety invariants behave as specified on synthetic and mocked data. Equity
+> figures produced in dry-run or against the synthetic world (which is deliberately generous) say
+> nothing about real returns, and this repository makes no performance claim.
 
 ---
 
@@ -111,6 +124,21 @@ All optional. Prefix `SNIPER_`, nesting with `__`. Any YAML key can be overridde
 | `SNIPER_ALERTS__DISCORD_WEBHOOK_URL` | Push alerts (HIGH/URGENT by default) |
 | `SNIPER_ALERTS__TELEGRAM_BOT_TOKEN` / `SNIPER_ALERTS__TELEGRAM_CHAT_ID` | Push alerts |
 | `SNIPER_CONFIG` | Path of the YAML config (default `configs/default.yaml`) |
+
+Configuration is strict: unknown YAML keys (including nested typos such as `risk.profil`) and
+unknown `SNIPER_*` variables in the environment or dotenv files abort startup with the offending
+key path; numbers must be finite and within documented bounds; validation errors never echo the
+supplied value. Variables that do not start with `SNIPER_` are never inspected. The service
+variables `SNIPER_SERVICE_MODE`, `SNIPER_HOME`, `SNIPER_VENV`, `SNIPER_PYTHON`,
+`SNIPER_SERVICE_LABEL` and `SNIPER_LAUNCH_AGENTS_DIR` are reserved for the deployment scripts.
+
+Credentials never reach logs or diagnostics: every configured secret and every URL-embedded
+credential (Helius `api-key`, Telegram bot token, Discord webhook token, userinfo) is registered
+with a redaction registry at load time; HTTP errors carry only method, sanitised endpoint and
+status (never query strings, headers or response bodies); structlog events, standard-library
+records (including handlers added by third parties) and tracebacks are scrubbed before they are
+written. `wallet_public_key` must decode from base58 to exactly 32 bytes; anything else is rejected
+without being echoed.
 
 ## 5. Providers
 
@@ -334,7 +362,13 @@ mypy              # --strict via pyproject
 * DexScreener does not expose a "new pairs" endpoint; PumpPortal + GeckoTerminal are the
   low-latency discovery paths. A Solana `logsSubscribe` adapter (Raydium/PumpSwap pool creation)
   is the natural next addition behind `TokenDiscoveryProvider`.
-* Fills in live signal mode are booked at quoted amounts unless the user reports actual amounts
-  (`b 1 <sol> <tokens> <sig>`); there is no on-chain fill reconciliation yet.
+* Fills in live signal mode are booked at quoted amounts (`ESTIMATED`) unless the user reports
+  actual amounts (`b 1 <sol> <tokens_ui> <sig>`, recorded as `USER_REPORTED`); there is no
+  on-chain fill reconciliation, so no record is ever `VERIFIED_ONCHAIN`.
+* Databases written before schema version 2 are migrated on first start: legacy fills, positions
+  and ledger rows are labelled `UNKNOWN_LEGACY` and legacy fill token amounts are kept under
+  `legacy_token_amount` because their unit was ambiguous (buys were UI, sells were raw). Legacy
+  open positions are still restored and valued from the displayed price, but they are flagged
+  `units?` and are not re-quoted, because their decimals are unverified.
 * The synthetic world is deliberately generous (runners pump several ×). It validates plumbing,
   not strategy profitability.

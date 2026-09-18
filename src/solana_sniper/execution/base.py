@@ -47,11 +47,12 @@ class Resolution:
 
 @dataclass(frozen=True, slots=True)
 class FillOverride:
-    """Optional actual amounts reported by the user after executing in their own wallet."""
+    """Amounts a human reports after executing in their own wallet (UI token units, as the wallet
+    shows them). A reported signature is stored verbatim and never treated as verification."""
 
     sol_amount: Decimal | None = None
-    token_amount: Decimal | None = None
-    tx_signature: str | None = None
+    token_amount_ui: Decimal | None = None
+    reported_tx_signature: str | None = None
 
 
 class ExecutionInterface(Protocol):

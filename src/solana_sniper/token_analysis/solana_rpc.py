@@ -10,6 +10,7 @@ from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.models import HolderDistribution, TokenAuthorities
 from solana_sniper.infra.http import HttpClient, HttpError, MalformedResponseError
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -134,7 +135,7 @@ class SolanaRpcTokenProvider:
         try:
             body = await self._rpc("getAccountInfo", [mint, {"encoding": "jsonParsed"}])
         except HttpError as exc:
-            log.warning("rpc_get_account_info_failed", mint=mint, error=str(exc))
+            log.warning("rpc_get_account_info_failed", mint=mint, error=safe_exception(exc))
             return None
         auth = parse_mint_account(body)
         if auth is not None:
@@ -153,7 +154,7 @@ class SolanaRpcTokenProvider:
         try:
             body = await self._rpc("getTokenLargestAccounts", [mint])
         except HttpError as exc:
-            log.warning("rpc_largest_accounts_failed", mint=mint, error=str(exc))
+            log.warning("rpc_largest_accounts_failed", mint=mint, error=safe_exception(exc))
             return None
         dist = parse_largest_accounts(body, supply, pool_addresses, self._clock.now())
         if dist is None:
@@ -178,7 +179,7 @@ class SolanaRpcTokenProvider:
             try:
                 body = await self._rpc("getTokenAccounts", [params])
             except HttpError as exc:
-                log.debug("helius_token_accounts_failed", mint=mint, error=str(exc))
+                log.debug("helius_token_accounts_failed", mint=mint, error=safe_exception(exc))
                 return None
             result = as_dict(body.get("result")) or {}
             accounts = as_list(result.get("token_accounts"))

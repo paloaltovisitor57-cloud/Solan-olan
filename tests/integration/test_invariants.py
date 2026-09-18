@@ -11,7 +11,13 @@ import pytest
 from solana_sniper.config.settings import QuotesConfig
 from solana_sniper.domain.clock import ManualClock
 from solana_sniper.domain.enums import CandidateState as S
-from solana_sniper.domain.enums import DecisionKind, DecisionSource, ExitReason, SignalKind
+from solana_sniper.domain.enums import (
+    DecisionKind,
+    DecisionSource,
+    ExitReason,
+    FillProvenance,
+    SignalKind,
+)
 from solana_sniper.domain.models import Fill, new_id
 from solana_sniper.execution.base import ExecutionInterface
 from solana_sniper.execution.manual import ManualExecution, OrderNotPendingError
@@ -166,11 +172,14 @@ def test_fill_never_simulated_in_manual_mode(clock: ManualClock) -> None:
         side=SignalKind.BUY,
         filled_at=clock.now(),
         sol_amount=Decimal(1),
-        token_amount=Decimal(1),
+        token_amount_ui=Decimal(1),
+        token_amount_raw=10**6,
+        token_decimals=6,
         eur_amount=Decimal(1),
         sol_eur=Decimal(1),
         fee_eur=Decimal(0),
         slippage_cost_eur=Decimal(0),
+        provenance=FillProvenance.ESTIMATED,
         simulated=False,
     )
-    assert not f.simulated
+    assert not f.simulated and f.provenance is FillProvenance.ESTIMATED and not f.is_verified

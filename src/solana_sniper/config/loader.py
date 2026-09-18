@@ -1,25 +1,65 @@
-"""Load Settings from YAML + environment, with a documented precedence: env > yaml > defaults."""
+"""Load Settings from YAML + environment with strict validation.
+
+Precedence (highest first): process environment > dotenv files (`.env`, then
+`$SNIPER_HOME/sniper.env`) > YAML file > model defaults.
+
+Strictness:
+* every YAML key must exist in the model (nested typos such as `risk.profil` are rejected with the
+  full key path);
+* every `SNIPER_*` variable in the environment or the dotenv files must map to a setting or be one
+  of the documented service variables; other environment variables are never inspected;
+* numbers must be finite and inside their documented bounds (see settings.py);
+* validation errors never echo the offending value (a mistyped private key must not end up in a
+  log or report).
+"""
 
 from __future__ import annotations
 
 import os
+import types
+import typing
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 import yaml
+from pydantic import BaseModel, ValidationError
 
 from solana_sniper.config.paths import DB_DIR, ENV_FILE, LOG_DIR, configured_home, ensure_home
 from solana_sniper.config.settings import Settings
+from solana_sniper.telemetry.redaction import register_secret, register_url_secrets
 
 DEFAULT_CONFIG_ENV = "SNIPER_CONFIG"
 DEFAULT_CONFIG_PATHS = (Path("configs/default.yaml"), Path("config.yaml"))
+ENV_PREFIX = "SNIPER_"
+# Variables consumed by the deployment scripts / launchd, not by the application model.
+SERVICE_ENV_KEYS = frozenset(
+    {
+        "SNIPER_CONFIG",
+        "SNIPER_HOME",
+        "SNIPER_SERVICE_MODE",
+        "SNIPER_VENV",
+        "SNIPER_PYTHON",
+        "SNIPER_SERVICE_LABEL",
+        "SNIPER_LAUNCH_AGENTS_DIR",
+    }
+)
 
 
+class ConfigError(Exception):
+    """Configuration problem with a human-readable, value-free summary."""
+
+    def __init__(self, problems: list[str]) -> None:
+        self.problems = problems
+        super().__init__("configuration invalid:\n  - " + "\n  - ".join(problems))
+
+
+# ---------------------------------------------------------------------------- YAML
 def _read_yaml(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         loaded = yaml.safe_load(fh) or {}
     if not isinstance(loaded, dict):
-        raise ValueError(f"{path}: top level must be a mapping")
+        raise ConfigError([f"{path}: top level must be a mapping"])
     return loaded
 
 
@@ -40,12 +80,124 @@ def resolve_config_path(explicit: Path | None) -> Path | None:
     return None
 
 
-def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings:
-    """Build Settings. YAML values are passed as init kwargs; env vars override them.
+def _model_of(annotation: Any) -> type[BaseModel] | None:
+    """The BaseModel class named by an annotation (unwrapping Optional/Union), else None."""
+    origin = typing.get_origin(annotation)
+    if origin in (typing.Union, types.UnionType):
+        for arg in typing.get_args(annotation):
+            found = _model_of(arg)
+            if found is not None:
+                return found
+        return None
+    if isinstance(annotation, type) and issubclass(annotation, BaseModel):
+        return annotation
+    return None
 
-    pydantic-settings precedence: init kwargs < env < dotenv is NOT what we want (env should
-    beat YAML), so we feed YAML through `_yaml_defaults` and let pydantic-settings apply env on top.
-    """
+
+def _dict_value_model(annotation: Any) -> type[BaseModel] | None:
+    if typing.get_origin(annotation) is dict:
+        args = typing.get_args(annotation)
+        if len(args) == 2:
+            return _model_of(args[1])
+    return None
+
+
+def unknown_keys(data: Mapping[str, Any], model: type[BaseModel], prefix: str = "") -> list[str]:
+    """Dotted paths of keys that no model field accepts, recursing into nested models."""
+    problems: list[str] = []
+    fields = model.model_fields
+    for key, value in data.items():
+        path = f"{prefix}{key}"
+        field = fields.get(str(key))
+        if field is None:
+            problems.append(f"unknown key '{path}'")
+            continue
+        nested = _model_of(field.annotation)
+        if nested is not None and isinstance(value, Mapping):
+            problems.extend(unknown_keys(value, nested, f"{path}."))
+            continue
+        value_model = _dict_value_model(field.annotation)
+        if value_model is not None and isinstance(value, Mapping):
+            for sub_key, sub_value in value.items():
+                if isinstance(sub_value, Mapping):
+                    problems.extend(unknown_keys(sub_value, value_model, f"{path}.{sub_key}."))
+    return problems
+
+
+# ---------------------------------------------------------------- environment
+def known_env_prefixes(model: type[BaseModel], prefix: str = ENV_PREFIX) -> set[str]:
+    """Upper-case env names (or prefixes for dict/list fields) the model can consume."""
+    names: set[str] = set()
+    for name, field in model.model_fields.items():
+        if field.exclude:
+            continue
+        env_name = f"{prefix}{name.upper()}"
+        nested = _model_of(field.annotation)
+        if nested is not None:
+            names.add(env_name)  # a whole nested section may be supplied as JSON
+            names |= known_env_prefixes(nested, f"{env_name}__")
+        elif _dict_value_model(field.annotation) is not None or typing.get_origin(
+            field.annotation
+        ) in (dict, list):
+            names.add(env_name)
+            names.add(f"{env_name}__*")
+        else:
+            names.add(env_name)
+    return names
+
+
+def _env_name_known(name: str, known: set[str]) -> bool:
+    upper = name.upper()
+    if upper in known or upper in SERVICE_ENV_KEYS:
+        return True
+    return any(upper.startswith(k[:-1]) for k in known if k.endswith("*"))
+
+
+def _dotenv_keys(path: Path) -> list[str]:
+    keys: list[str] = []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return keys
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key.startswith("export "):
+            key = key[len("export ") :].strip()
+        keys.append(key)
+    return keys
+
+
+def audit_environment(
+    environ: Mapping[str, str], dotenv_paths: list[Path], model: type[BaseModel] = Settings
+) -> list[str]:
+    """Names of SNIPER_* variables (process env or dotenv) that map to nothing. Values are never
+    read, so the audit cannot leak them."""
+    known = known_env_prefixes(model)
+    problems: list[str] = []
+    for name in sorted(environ):
+        if name.upper().startswith(ENV_PREFIX) and not _env_name_known(name, known):
+            problems.append(f"unknown environment variable '{name}'")
+    for path in dotenv_paths:
+        for name in _dotenv_keys(path):
+            if name.upper().startswith(ENV_PREFIX) and not _env_name_known(name, known):
+                problems.append(f"unknown variable '{name}' in {path}")
+    return problems
+
+
+def _validation_problems(exc: ValidationError) -> list[str]:
+    """Field paths and messages only: the offending input is deliberately omitted."""
+    out: list[str] = []
+    for err in exc.errors(include_url=False, include_input=False, include_context=False):
+        loc = ".".join(str(part) for part in err.get("loc", ()))
+        out.append(f"{loc or '<root>'}: {err.get('msg', 'invalid')}")
+    return out
+
+
+# -------------------------------------------------------------------- loading
+def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings:
     path = resolve_config_path(config_path)
     yaml_data: dict[str, Any] = _read_yaml(path) if path else {}
     for key, value in overrides.items():
@@ -53,6 +205,16 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
             yaml_data[key] = {**yaml_data[key], **value}
         else:
             yaml_data[key] = value
+    problems = [f"{path or 'overrides'}: {p}" for p in unknown_keys(yaml_data, Settings)]
+
+    home = configured_home()
+    env_files: list[str] = [".env"]
+    if home is not None:
+        ensure_home(home)
+        env_files.append(str(home / ENV_FILE))
+    problems.extend(audit_environment(os.environ, [Path(f) for f in env_files if Path(f).exists()]))
+    if problems:
+        raise ConfigError(problems)
 
     class _YamlSettings(Settings):
         @classmethod
@@ -70,16 +232,18 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
             # highest priority first
             return (env_settings, dotenv_settings, yaml_source, init_settings)
 
-    home = configured_home()
-    env_files: list[str] = [".env"]
-    if home is not None:
-        ensure_home(home)
-        env_files.append(str(home / ENV_FILE))
-    settings = _YamlSettings(_env_file=env_files)
+    try:
+        settings = _YamlSettings(_env_file=env_files)
+    except ValidationError as exc:
+        raise ConfigError(_validation_problems(exc)) from None
     settings.config_path = path
     settings.home = home
     if home is not None:
         apply_home(settings, home)
+    for secret in settings.secret_values():
+        register_secret(secret)
+    for url in settings.credential_urls():
+        register_url_secrets(url)
     return settings
 
 

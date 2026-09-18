@@ -29,7 +29,7 @@ async def test_confirm_buy_requotes_when_signal_quote_is_old(harness: Harness) -
     msg = await engine.confirm_buy(order.ref)
     assert "confirmed" in msg
     pos = harness.runtime.account.open_positions[0]
-    assert pos.quantity != signal_tokens  # booked at a fresh quote, price moved meanwhile
+    assert pos.quantity_ui != signal_tokens  # booked at a fresh quote, price moved meanwhile
     assert pos.entry_sol == order.buy.quote.spend_sol
     decision = ex.history[-1].decision
     assert decision.note == "booked at fresh quote"

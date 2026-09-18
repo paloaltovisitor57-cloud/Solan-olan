@@ -9,6 +9,7 @@ from typing import Protocol
 from solana_sniper.discovery.parsing import as_decimal, as_dict
 from solana_sniper.infra.http import HttpClient, HttpError
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -78,7 +79,9 @@ class CoinGeckoFx:
                 f"{self._base}/simple/price", params={"ids": "solana", "vs_currencies": "eur,usd"}
             )
         except HttpError as exc:
-            log.warning("fx_refresh_failed", error=str(exc), using_sol_eur=str(self._sol_eur))
+            log.warning(
+                "fx_refresh_failed", error=safe_exception(exc), using_sol_eur=str(self._sol_eur)
+            )
             return
         sol = as_dict((as_dict(res.json) or {}).get("solana")) or {}
         eur = as_decimal(sol.get("eur"))

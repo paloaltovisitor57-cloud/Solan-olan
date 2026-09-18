@@ -18,6 +18,7 @@ from solana_sniper.domain.enums import Venue
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo
 from solana_sniper.infra.http import HttpClient, HttpError
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -143,7 +144,7 @@ class GeckoTerminalDiscovery:
                     headers={"accept": "application/json;version=20230302"},
                 )
             except HttpError as exc:
-                log.warning("geckoterminal_poll_failed", error=str(exc))
+                log.warning("geckoterminal_poll_failed", error=safe_exception(exc))
                 break
             data = as_list((as_dict(res.json) or {}).get("data"))
             for item in data:

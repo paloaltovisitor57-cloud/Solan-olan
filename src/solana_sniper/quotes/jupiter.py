@@ -17,6 +17,7 @@ from solana_sniper.infra.http import HttpClient, HttpError, RateLimitedError
 from solana_sniper.quotes.base import QuoteError
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -150,7 +151,7 @@ class JupiterQuoteProvider:
                 timeout_s=self._timeout,
             )
         except HttpError as exc:
-            log.warning("jupiter_swap_build_failed", error=str(exc))
+            log.warning("jupiter_swap_build_failed", error=safe_exception(exc))
             return None
         body = as_dict(res.json) or {}
         return as_str(body.get("swapTransaction"))

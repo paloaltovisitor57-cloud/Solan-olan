@@ -12,6 +12,7 @@ from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.models import TokenInfo
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
+from solana_sniper.telemetry.redaction import safe_exception
 
 log = get_logger(__name__)
 
@@ -94,7 +95,9 @@ class DiscoveryService:
                 raise
             except Exception as exc:
                 self._metrics.inc("provider_errors")
-                log.warning("discovery_poll_error", provider=provider.name, error=str(exc))
+                log.warning(
+                    "discovery_poll_error", provider=provider.name, error=safe_exception(exc)
+                )
             await asyncio.sleep(interval)
 
     async def run(self) -> None:

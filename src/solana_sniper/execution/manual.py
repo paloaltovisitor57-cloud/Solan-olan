@@ -8,9 +8,22 @@ from decimal import Decimal
 
 from solana_sniper.config.settings import QuotesConfig
 from solana_sniper.domain.clock import Clock
-from solana_sniper.domain.enums import DecisionKind, DecisionSource, SignalKind, SignalStatus
+from solana_sniper.domain.enums import (
+    DecisionKind,
+    DecisionSource,
+    FillProvenance,
+    SignalKind,
+    SignalStatus,
+)
 from solana_sniper.domain.models import BuySignal, Fill, ManualDecision, SellSignal, new_id
-from solana_sniper.domain.money import ZERO, lamports_to_sol, q_eur
+from solana_sniper.domain.money import (
+    ZERO,
+    check_decimals,
+    lamports_to_sol,
+    q_eur,
+    raw_to_ui,
+    ui_to_raw,
+)
 from solana_sniper.execution.base import FillOverride, PendingOrder, Resolution
 
 
@@ -155,17 +168,34 @@ class ManualExecution:
         return expired
 
     # ------------------------------------------------------------------ fills
+    def _provenance(self, override: FillOverride | None) -> FillProvenance:
+        if self.simulated:
+            return FillProvenance.SIMULATED
+        if override is not None and (
+            override.sol_amount is not None
+            or override.token_amount_ui is not None
+            or override.reported_tx_signature
+        ):
+            return FillProvenance.USER_REPORTED
+        return FillProvenance.ESTIMATED
+
     def _build_fill(
         self, order: PendingOrder, now: datetime, override: FillOverride | None
     ) -> Fill:
+        provenance = self._provenance(override)
+        signature = override.reported_tx_signature if override else None
         if order.kind is SignalKind.BUY:
             assert order.buy is not None
             sig = order.buy
+            decimals = check_decimals(sig.token_decimals)
             sol = sig.quote.spend_sol
-            tokens = sig.quote.expected_tokens_ui
+            tokens_ui = sig.quote.expected_tokens_ui
             if override is not None:
                 sol = override.sol_amount if override.sol_amount is not None else sol
-                tokens = override.token_amount if override.token_amount is not None else tokens
+                if override.token_amount_ui is not None:
+                    tokens_ui = override.token_amount_ui
+            tokens_raw = ui_to_raw(tokens_ui, decimals)
+            tokens_ui = raw_to_ui(tokens_raw, decimals)  # canonical: representable exactly
             slippage = self._buy_slippage_cost(sig, sol)
             return Fill(
                 fill_id=new_id("fill"),
@@ -174,22 +204,30 @@ class ManualExecution:
                 side=SignalKind.BUY,
                 filled_at=now,
                 sol_amount=sol,
-                token_amount=tokens,
+                token_amount_ui=tokens_ui,
+                token_amount_raw=tokens_raw,
+                token_decimals=decimals,
                 eur_amount=q_eur(sol * sig.sol_eur),
                 sol_eur=sig.sol_eur,
                 fee_eur=q_eur(lamports_to_sol(sig.quote.total_fee_lamports // 2) * sig.sol_eur),
                 slippage_cost_eur=slippage,
+                provenance=provenance,
                 simulated=self.simulated,
-                tx_signature=override.tx_signature if override else None,
+                reported_tx_signature=signature,
             )
         assert order.sell is not None
         sig_s = order.sell
+        decimals = check_decimals(sig_s.token_decimals)
         sol_out = (
             sig_s.estimated_sell_output_sol if sig_s.estimated_sell_output_sol is not None else ZERO
         )
         if override is not None and override.sol_amount is not None:
             sol_out = override.sol_amount
-        tokens_sold = Decimal(sig_s.exit_quote.in_amount_raw) if sig_s.exit_quote else ZERO
+        # The whole position is sold: quantity comes from the position (UI units), never from a
+        # raw quote amount.
+        tokens_ui = sig_s.quantity_ui
+        tokens_raw = ui_to_raw(tokens_ui, decimals)
+        tokens_ui = raw_to_ui(tokens_raw, decimals)
         fee_lamports = sig_s.exit_quote.fee_lamports if sig_s.exit_quote else 0
         fee_lamports += (
             self._quotes.estimated_network_fee_lamports + self._quotes.priority_fee_lamports
@@ -201,7 +239,9 @@ class ManualExecution:
             side=SignalKind.SELL,
             filled_at=now,
             sol_amount=sol_out,
-            token_amount=tokens_sold,
+            token_amount_ui=tokens_ui,
+            token_amount_raw=tokens_raw,
+            token_decimals=decimals,
             eur_amount=q_eur(sol_out * sig_s.sol_eur),
             sol_eur=sig_s.sol_eur,
             fee_eur=q_eur(lamports_to_sol(fee_lamports) * sig_s.sol_eur),
@@ -210,8 +250,9 @@ class ManualExecution:
                 if sig_s.current_value_eur > sol_out * sig_s.sol_eur
                 else ZERO
             ),
+            provenance=provenance,
             simulated=self.simulated,
-            tx_signature=override.tx_signature if override else None,
+            reported_tx_signature=signature,
         )
 
     @staticmethod
@@ -248,7 +289,9 @@ class DryRunExecution(ManualExecution):
         if override is None:
             haircut = Decimal(10_000 - self._extra_bps) / Decimal(10_000)
             if order.kind is SignalKind.BUY and order.buy is not None:
-                override = FillOverride(token_amount=order.buy.quote.expected_tokens_ui * haircut)
+                override = FillOverride(
+                    token_amount_ui=order.buy.quote.expected_tokens_ui * haircut
+                )
             elif order.sell is not None and order.sell.estimated_sell_output_sol is not None:
                 override = FillOverride(sol_amount=order.sell.estimated_sell_output_sol * haircut)
         return super()._build_fill(order, now, override)

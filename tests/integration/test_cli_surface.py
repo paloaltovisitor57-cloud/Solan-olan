@@ -60,7 +60,7 @@ async def test_dashboard_renders_and_commands_confirm(harness: Harness) -> None:
     await handler.handle(f"b {ref} 0.05 100000 5sig")
     assert any(f"BUY #{ref} confirmed" in s for s in said), said
     pos = harness.runtime.account.open_positions[0]
-    assert pos.quantity == Decimal("100000") and pos.entry_sol == Decimal("0.05")
+    assert pos.quantity_ui == Decimal("100000") and pos.entry_sol == Decimal("0.05")
     cand = engine.candidates[pos.mint]
     assert cand.state is S.OPEN
     # drive until a sell signal appears, then ignore it and confirm the next one

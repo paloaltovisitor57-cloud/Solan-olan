@@ -6,6 +6,7 @@ from solana_sniper.alerts.base import Alert
 from solana_sniper.domain.enums import Urgency
 from solana_sniper.infra.http import HttpClient, HttpError
 from solana_sniper.telemetry.logging import get_logger
+from solana_sniper.telemetry.redaction import register_secret, register_url_secrets, safe_exception
 
 log = get_logger(__name__)
 
@@ -16,6 +17,7 @@ class DiscordAlertProvider:
     def __init__(self, http: HttpClient, webhook_url: str) -> None:
         self._http = http
         self._url = webhook_url
+        register_url_secrets(webhook_url)
 
     async def send(self, alert: Alert) -> None:
         marker = (
@@ -30,7 +32,7 @@ class DiscordAlertProvider:
                 retries=1,
             )
         except HttpError as exc:
-            log.warning("discord_alert_failed", error=str(exc))
+            log.warning("discord_alert_failed", error=safe_exception(exc))
 
 
 class TelegramAlertProvider:
@@ -40,6 +42,7 @@ class TelegramAlertProvider:
         self._http = http
         self._url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         self._chat_id = chat_id
+        register_secret(bot_token)
 
     async def send(self, alert: Alert) -> None:
         marker = (
@@ -57,4 +60,4 @@ class TelegramAlertProvider:
                 retries=1,
             )
         except HttpError as exc:
-            log.warning("telegram_alert_failed", error=str(exc))
+            log.warning("telegram_alert_failed", error=safe_exception(exc))

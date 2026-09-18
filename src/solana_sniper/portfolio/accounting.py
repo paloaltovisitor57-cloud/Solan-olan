@@ -14,7 +14,15 @@ from datetime import datetime
 from decimal import Decimal
 
 from solana_sniper.domain.clock import Clock
-from solana_sniper.domain.enums import CandidateState, ExitReason, LedgerEntryKind, SignalKind
+from solana_sniper.domain.enums import (
+    CandidateState,
+    ExitReason,
+    FillProvenance,
+    LedgerEntryKind,
+    SignalKind,
+    TokenUnits,
+    weakest_provenance,
+)
 from solana_sniper.domain.models import (
     Fill,
     LedgerEntry,
@@ -84,6 +92,7 @@ class PortfolioAccount:
         slippage: Decimal = ZERO,
         realized: Decimal = ZERO,
         reference_id: str | None = None,
+        provenance: FillProvenance = FillProvenance.UNKNOWN_LEGACY,
     ) -> LedgerEntry:
         new_cash = q_eur(self.cash + cash_delta)
         if new_cash < 0:
@@ -106,6 +115,7 @@ class PortfolioAccount:
             slippage_eur=q_eur(slippage),
             realized_pnl_eur=q_eur(realized),
             reference_id=reference_id,
+            provenance=provenance,
         )
         self.ledger.append(entry)
         return entry
@@ -113,7 +123,9 @@ class PortfolioAccount:
     def deposit(self, amount: Decimal, description: str = "deposit") -> LedgerEntry:
         if amount <= 0:
             raise ValueError("deposit must be positive")
-        entry = self._append(LedgerEntryKind.DEPOSIT, amount, description)
+        entry = self._append(
+            LedgerEntryKind.DEPOSIT, amount, description, provenance=FillProvenance.USER_REPORTED
+        )
         self._update_peak()
         return entry
 
@@ -128,8 +140,8 @@ class PortfolioAccount:
     ) -> Position:
         if fill.side is not SignalKind.BUY:
             raise ValueError("open_position requires a BUY fill")
-        if fill.token_amount <= 0:
-            raise ValueError("fill token_amount must be positive")
+        if fill.token_amount_ui <= 0 or fill.token_amount_raw <= 0:
+            raise ValueError("fill token amount must be positive")
         total_cost = q_eur(fill.eur_amount + fill.fee_eur)
         if total_cost > self.cash:
             raise InsufficientCashError(
@@ -142,7 +154,11 @@ class PortfolioAccount:
             opened_at=fill.filled_at,
             entry_price_native=entry_price_native,
             entry_sol_eur=fill.sol_eur,
-            quantity=fill.token_amount,
+            quantity_ui=fill.token_amount_ui,
+            quantity_raw=fill.token_amount_raw,
+            token_decimals=fill.token_decimals,
+            units=TokenUnits.UI,
+            provenance=fill.provenance,
             cost_basis_eur=total_cost,
             entry_sol=fill.sol_amount,
             entry_fee_eur=q_eur(fill.fee_eur),
@@ -161,13 +177,14 @@ class PortfolioAccount:
         self._append(
             LedgerEntryKind.BUY,
             -total_cost,
-            f"BUY {symbol or fill.mint[:8]} qty={fill.token_amount} for {total_cost} EUR",
+            f"BUY {symbol or fill.mint[:8]} qty={fill.token_amount_ui} for {total_cost} EUR",
             at=fill.filled_at,
             position_id=position.position_id,
             mint=fill.mint,
             fee=fill.fee_eur,
             slippage=fill.slippage_cost_eur,
             reference_id=fill.fill_id,
+            provenance=fill.provenance,
         )
         self.fees_total = q_eur(self.fees_total + fill.fee_eur)
         self.slippage_total = q_eur(self.slippage_total + fill.slippage_cost_eur)
@@ -211,7 +228,7 @@ class PortfolioAccount:
         self._append(
             LedgerEntryKind.SELL,
             proceeds,
-            f"SELL {pos.symbol or pos.mint[:8]} qty={fill.token_amount} "
+            f"SELL {pos.symbol or pos.mint[:8]} qty={fill.token_amount_ui} "
             f"for {proceeds} EUR ({reason})",
             at=fill.filled_at,
             position_id=pos.position_id,
@@ -220,7 +237,9 @@ class PortfolioAccount:
             slippage=fill.slippage_cost_eur,
             realized=realized,
             reference_id=fill.fill_id,
+            provenance=fill.provenance,
         )
+        pos.provenance = weakest_provenance(pos.provenance, fill.provenance)
         pos.state = CandidateState.CLOSED
         pos.closed_at = fill.filled_at
         pos.exit_value_eur = proceeds

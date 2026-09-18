@@ -15,6 +15,7 @@ from solana_sniper.portfolio.fx import CoinGeckoFx
 from solana_sniper.quotes.base import QuoteError
 from solana_sniper.quotes.jupiter import JupiterQuoteProvider
 from solana_sniper.storage.repository import Repository
+from solana_sniper.telemetry.redaction import safe_exception, safe_url
 from solana_sniper.token_analysis.solana_rpc import SolanaRpcTokenProvider
 
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
@@ -49,12 +50,12 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
             CheckOutcome(
                 "database",
                 "PASS",
-                f"{settings.storage.database_url} tokens={counts['tokens']} positions={counts['positions']} "
+                f"{safe_url(settings.storage.database_url)} tokens={counts['tokens']} positions={counts['positions']} "
                 f"cash={'€' + str(state.cash) if state.has_account else 'no account yet'}",
             )
         )
     except Exception as exc:
-        out.append(CheckOutcome("database", "FAIL", str(exc)))
+        out.append(CheckOutcome("database", "FAIL", safe_exception(exc)))
     # credentials
     p = settings.providers
     out.append(
@@ -83,11 +84,15 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
                 CheckOutcome(
                     "solana_rpc",
                     "PASS" if ok else "FAIL",
-                    f"{p.solana_rpc_url} getAccountInfo(USDC) -> {'ok' if ok else 'unreachable or unexpected response'}",
+                    f"{safe_url(p.solana_rpc_url)} getAccountInfo(USDC) -> {'ok' if ok else 'unreachable or unexpected response'}",
                 )
             )
         except Exception as exc:
-            out.append(CheckOutcome("solana_rpc", "FAIL", f"{p.solana_rpc_url}: {exc}"))
+            out.append(
+                CheckOutcome(
+                    "solana_rpc", "FAIL", f"{safe_url(p.solana_rpc_url)}: {safe_exception(exc)}"
+                )
+            )
         # DexScreener
         try:
             res = await http.get_json(
@@ -101,7 +106,7 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
                 )
             )
         except HttpError as exc:
-            out.append(CheckOutcome("dexscreener", "FAIL", str(exc)))
+            out.append(CheckOutcome("dexscreener", "FAIL", safe_exception(exc)))
         # GeckoTerminal
         if "geckoterminal" in settings.discovery.sources:
             try:
@@ -116,7 +121,7 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
                     CheckOutcome("geckoterminal", "PASS", f"{res.latency_ms:.0f}ms, {n} new pools")
                 )
             except HttpError as exc:
-                out.append(CheckOutcome("geckoterminal", "FAIL", str(exc)))
+                out.append(CheckOutcome("geckoterminal", "FAIL", safe_exception(exc)))
         # Jupiter quote
         try:
             jup = JupiterQuoteProvider(
@@ -136,7 +141,7 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
                 )
             )
         except QuoteError as exc:
-            out.append(CheckOutcome("jupiter_quote", "FAIL", str(exc)))
+            out.append(CheckOutcome("jupiter_quote", "FAIL", safe_exception(exc)))
         # FX
         fx = CoinGeckoFx(
             http,
@@ -147,7 +152,7 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
         try:
             await fx.refresh()
         except Exception as exc:
-            out.append(CheckOutcome("fx_coingecko", "FAIL", str(exc)))
+            out.append(CheckOutcome("fx_coingecko", "FAIL", safe_exception(exc)))
         out.append(
             CheckOutcome(
                 "fx_coingecko",
@@ -165,14 +170,16 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
                     conn = await websockets.connect(p.pumpportal_ws_url, open_timeout=timeout_s)
                     await conn.close()
                 out.append(
-                    CheckOutcome("pumpportal_ws", "PASS", f"connected to {p.pumpportal_ws_url}")
+                    CheckOutcome(
+                        "pumpportal_ws", "PASS", f"connected to {safe_url(p.pumpportal_ws_url)}"
+                    )
                 )
             except Exception as exc:
                 out.append(
                     CheckOutcome(
                         "pumpportal_ws",
                         "FAIL",
-                        f"{p.pumpportal_ws_url}: {type(exc).__name__}: {exc}",
+                        f"{safe_url(p.pumpportal_ws_url)}: {safe_exception(exc)}",
                     )
                 )
     finally:

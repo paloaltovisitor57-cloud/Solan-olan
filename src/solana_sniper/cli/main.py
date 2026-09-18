@@ -20,6 +20,7 @@ from solana_sniper.domain.enums import RunMode
 from solana_sniper.domain.money import q_display
 from solana_sniper.storage.repository import Repository
 from solana_sniper.telemetry.logging import configure_logging
+from solana_sniper.telemetry.redaction import safe_url
 
 app = typer.Typer(
     help="Live Solana new-token sniper: discover, score, size, confirm manually.",
@@ -204,7 +205,10 @@ def status(config: ConfigOpt = None) -> None:
         if snap is None:
             console.print("no portfolio snapshot yet")
         else:
-            table = Table(title=f"portfolio @ {snap.at:%Y-%m-%d %H:%M:%S}")
+            table = Table(
+                title=f"portfolio @ {snap.at:%Y-%m-%d %H:%M:%S}  "
+                "(simulated / quote-estimated / user-reported records; not on-chain verified)"
+            )
             table.add_column("metric")
             table.add_column("value", justify="right")
             for k, v in (
@@ -256,8 +260,13 @@ def positions(
             "peak",
             "pnl",
             "reason",
+            "prov",
         ):
             table.add_column(col)
+        console.print(
+            "[yellow]provenance: SIMULATED / ESTIMATED (quoted amounts) / USER_REPORTED / "
+            "UNKNOWN_LEGACY. No record is on-chain verified.[/]"
+        )
         for p in rows:
             pnl = p.realized_pnl_eur if p.realized_pnl_eur is not None else p.unrealized_pnl_eur
             table.add_row(
@@ -265,12 +274,13 @@ def positions(
                 p.symbol or p.mint[:6],
                 str(p.state),
                 f"{p.opened_at:%m-%d %H:%M:%S}",
-                f"{p.quantity:,.0f}",
+                f"{p.quantity_ui:,.0f}" + ("" if p.units_known else " (units?)"),
                 f"€{q_display(p.cost_basis_eur)}",
                 f"€{q_display(p.exit_value_eur if p.exit_value_eur is not None else p.current_value_eur)}",
                 f"€{q_display(p.peak_value_eur)}",
                 f"€{q_display(pnl)} ({p.pnl_pct:+.0%})",
                 str(p.exit_reason or ""),
+                str(p.provenance),
             )
         console.print(table if rows else "no positions")
 
@@ -310,8 +320,16 @@ def portfolio(config: ConfigOpt = None) -> None:
             f"slippage €{q_display(state.slippage)}  peak €{q_display(state.peak_equity)}  W/L {state.wins}/{state.losses}  "
             f"open positions {len(state.positions)}  milestones {[str(m) for m in state.milestones_reached]}"
         )
+        mix: dict[str, int] = {}
+        for entry in state.ledger:
+            mix[str(entry.provenance)] = mix.get(str(entry.provenance), 0) + 1
+        console.print(
+            "[yellow]Every figure is simulated, quote-estimated or user-reported; nothing is "
+            "reconciled against the chain.[/] ledger provenance mix: "
+            + (", ".join(f"{k} {v}" for k, v in sorted(mix.items())) or "empty")
+        )
         table = Table(title="ledger (last 25)")
-        for col in ("seq", "at", "kind", "delta", "cash after", "pnl", "description"):
+        for col in ("seq", "at", "kind", "delta", "cash after", "pnl", "prov", "description"):
             table.add_column(col)
         for e in state.ledger[-25:]:
             table.add_row(
@@ -321,6 +339,7 @@ def portfolio(config: ConfigOpt = None) -> None:
                 f"{q_display(e.cash_delta_eur):+}",
                 f"€{q_display(e.cash_after_eur)}",
                 f"{q_display(e.realized_pnl_eur):+}",
+                str(e.provenance),
                 e.description[:60],
             )
         console.print(table)
@@ -537,7 +556,7 @@ def config_check(config: ConfigOpt = None) -> None:
         f"config {settings.config_path or 'defaults'}  home {settings.home or '(cwd)'}  "
         f"profile {settings.risk.profile}  bankroll €{settings.risk.starting_bankroll_eur}  "
         f"sources {settings.discovery.sources}  quotes {settings.quotes.source}  "
-        f"db {settings.storage.database_url}  log {settings.telemetry.log_file}"
+        f"db {safe_url(settings.storage.database_url)}  log {settings.telemetry.log_file}"
     )
     if problems:
         for p in problems:

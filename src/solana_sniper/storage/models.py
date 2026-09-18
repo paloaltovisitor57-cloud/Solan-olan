@@ -153,6 +153,8 @@ class LedgerRow(Base):
     slippage_eur: Mapped[str] = mapped_column(String(40))
     realized_pnl_eur: Mapped[str] = mapped_column(String(40))
     reference_id: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    # UNKNOWN_LEGACY for rows written before provenance existed (migration 2); never upgraded
+    provenance: Mapped[str | None] = mapped_column(String(24), nullable=True)
 
 
 class AccountStateRow(Base):

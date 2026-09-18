@@ -207,6 +207,16 @@ def _validation_problems(exc: ValidationError) -> list[str]:
 
 
 # -------------------------------------------------------------------- loading
+_DATABASE_OVERRIDE: str | None = None
+
+
+def set_database_override(url: str | None) -> None:
+    """Process-local database selection (the CLI's global `--paper` option). Applied after every
+    other source, so an explicit flag wins; never written to os.environ."""
+    global _DATABASE_OVERRIDE
+    _DATABASE_OVERRIDE = url
+
+
 def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings:
     path = resolve_config_path(config_path)
     yaml_data: dict[str, Any] = _read_yaml(path) if path else {}
@@ -276,6 +286,8 @@ def load_settings(config_path: Path | None = None, **overrides: Any) -> Settings
     settings.config_path = path
     settings.home = home
     apply_home(settings, home)
+    if _DATABASE_OVERRIDE is not None:
+        settings.storage.database_url = _DATABASE_OVERRIDE
     for secret in settings.secret_values():
         register_secret(secret)
     for url in settings.credential_urls():

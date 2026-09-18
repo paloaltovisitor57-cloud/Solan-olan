@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from solana_sniper.config.loader import set_database_override
+from solana_sniper.config.paths import set_home_override
 from solana_sniper.config.settings import Settings
 from solana_sniper.domain.clock import ManualClock
 from solana_sniper.domain.enums import FillProvenance, SignalKind
@@ -20,6 +22,8 @@ def isolated_runtime_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pa
     different home set SNIPER_HOME themselves (they run after this fixture)."""
     home = tmp_path / "sniper-home"
     monkeypatch.setenv("SNIPER_HOME", str(home))
+    set_home_override(None)
+    set_database_override(None)
     return home
 
 

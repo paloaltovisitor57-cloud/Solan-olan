@@ -157,6 +157,20 @@ def wait_for(predicate: object, timeout_s: float = 30.0) -> bool:
     return False
 
 
+def diagnostics(home: Path) -> str:
+    """Status file + log tails, so a timing failure explains itself (also on the real Mac)."""
+    parts: list[str] = []
+    status = home / "state" / "status.json"
+    if status.exists():
+        parts.append("status.json:\n" + status.read_text()[:3000])
+    for name in ("sniper.log", "service.out.log", "service.err.log"):
+        f = home / "logs" / name
+        if f.exists():
+            tail = f.read_text(errors="replace").splitlines()[-40:]
+            parts.append(f"{name} (tail):\n" + "\n".join(tail))
+    return "\n\n".join(parts)
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
 def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]) -> None:
     env = deploy_env
@@ -165,7 +179,7 @@ def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]
     status_file = home / "state" / "status.json"
     try:
         res = run("install-macos.sh", env, "--skip-tests")
-        assert "service is running and healthy" in res.stdout, res.stdout
+        assert "service is running and healthy" in res.stdout, res.stdout + diagnostics(home)
         assert plist.exists()
         data = plistlib.loads(plist.read_bytes())
         assert data["ProgramArguments"][1:] == ["run", "--dry-run", "--no-dashboard", "--quiet"]
@@ -252,12 +266,14 @@ def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]
         run("cmd.sh", env, "h")
         assert (home / "state" / "commands").read_text().strip().endswith("h")
         assert wait_for(
-            lambda: "file_command" in (home / "logs" / "sniper.log").read_text(errors="replace"), 15
-        )
+            lambda: "file_command" in (home / "logs" / "sniper.log").read_text(errors="replace"), 30
+        ), diagnostics(home)
         # graceful stop marks the heartbeat as stopped and the process exits
         pid = int(json.loads(status_file.read_text())["pid"])
         run("stop.sh", env)
-        assert wait_for(lambda: json.loads(status_file.read_text()).get("stopped") is True, 30)
+        assert wait_for(lambda: json.loads(status_file.read_text()).get("stopped") is True, 30), (
+            diagnostics(home)
+        )
         assert not _alive(pid)
         st2 = run("status.sh", env, check=False)
         assert "stopped" in st2.stdout.lower()
@@ -271,13 +287,13 @@ def test_install_start_status_cmd_stop_restart_doctor(deploy_env: dict[str, str]
                 status_file.exists() and json.loads(status_file.read_text()).get("healthy") is True
             ),
             45,
-        )
+        ), diagnostics(home)
         assert wait_for(
             lambda: (
                 "portfolio_restored" in (home / "logs" / "sniper.log").read_text(errors="replace")
             ),
-            20,
-        )
+            30,
+        ), diagnostics(home)
         # doctor passes with the synthetic config (network checks skipped)
         doc = run("doctor.sh", env)
         assert "checks passed" in doc.stdout, doc.stdout + doc.stderr

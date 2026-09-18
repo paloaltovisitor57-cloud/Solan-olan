@@ -6,7 +6,6 @@ import asyncio
 import contextlib
 import json
 import logging
-import os
 import subprocess
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -65,11 +64,13 @@ def _root(
     ] = None,
 ) -> None:
     """solana-sniper: live-data paper trading and signal research for new Solana tokens."""
-    if home is not None:
-        os.environ["SNIPER_HOME"] = str(home.expanduser())
+    from solana_sniper.config.loader import set_database_override
+    from solana_sniper.config.paths import configured_home, set_home_override
+
+    set_home_override(home)
+    set_database_override(None)
     if paper_session is not None:
         from solana_sniper.app.paper import paper_db_path, paper_db_url
-        from solana_sniper.config.paths import configured_home
 
         runtime_home = configured_home()
         if not paper_db_path(runtime_home, paper_session).exists():
@@ -77,7 +78,7 @@ def _root(
                 f"[red]no paper session {paper_session!r} in {runtime_home / 'db' / 'paper'}[/]"
             )
             raise typer.Exit(code=2)
-        os.environ["SNIPER_STORAGE__DATABASE_URL"] = paper_db_url(runtime_home, paper_session)
+        set_database_override(paper_db_url(runtime_home, paper_session))
 
 
 def _context_line(settings: object) -> str:

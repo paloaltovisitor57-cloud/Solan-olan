@@ -36,7 +36,7 @@ fi
 
 # 3. dependencies
 info "installing dependencies"
-pip_install -e "${REPO_DIR}[dev]"
+pip_install -e "${REPO_DIR}[dev,web]"
 
 # 4. directories + local env
 ensure_dirs

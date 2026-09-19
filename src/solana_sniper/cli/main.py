@@ -516,6 +516,97 @@ def smoke_test(
     console.print("[green]all required checks passed[/]")
 
 
+@app.command("dashboard-web")
+def dashboard_web(
+    paper_session: Annotated[
+        str | None,
+        typer.Option("--paper", help="Open this paper session first (id from `paper --list`)"),
+    ] = None,
+    session: Annotated[
+        str | None,
+        typer.Option("--session", help="Open this live/dry-run session id first"),
+    ] = None,
+    host: Annotated[
+        str,
+        typer.Option(
+            "--host",
+            help="Bind address. Default 127.0.0.1 (this Mac only). Anything else exposes the "
+            "page to that network; use Tailscale or SSH if you want it on your phone.",
+        ),
+    ] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help="TCP port")] = 8501,
+    refresh_seconds: Annotated[
+        float, typer.Option("--refresh-seconds", help="Auto-refresh interval (1-60)")
+    ] = 3.0,
+    no_browser: Annotated[
+        bool, typer.Option("--no-browser", help="Do not open the browser automatically")
+    ] = False,
+    print_command: Annotated[
+        bool,
+        typer.Option("--print-command", help="Show the streamlit command and exit", hidden=True),
+    ] = False,
+) -> None:
+    """Read-only web dashboard (Streamlit) over the recorded sessions: paper and live. It reads
+    the databases and the heartbeat, nothing else: no keys, no signing, no broadcasting, no
+    settings or commands can be changed from the browser."""
+    from solana_sniper.config.paths import configured_home, home_source
+    from solana_sniper.web.launch import (
+        DashboardLaunchError,
+        build_plan,
+        run_plan,
+        web_dependencies_available,
+    )
+
+    home = configured_home()
+    if not web_dependencies_available():
+        from solana_sniper.web.launch import INSTALL_HINT
+
+        console.print(f"[red]cannot start the web dashboard:[/] {INSTALL_HINT}")
+        raise typer.Exit(code=2)
+    try:
+        plan = build_plan(
+            home=home,
+            paper=paper_session,
+            session=session,
+            host=host,
+            port=port,
+            refresh_seconds=refresh_seconds,
+            open_browser=not no_browser,
+        )
+    except DashboardLaunchError as exc:
+        console.print(f"[red]cannot start the web dashboard:[/] {exc}")
+        raise typer.Exit(code=2) from None
+    if paper_session is not None:
+        from solana_sniper.app.paper import paper_db_path
+
+        if not paper_db_path(home, paper_session).exists():
+            console.print(
+                f"[red]no paper session {paper_session!r} in {home / 'db' / 'paper'}[/] "
+                "(solana-sniper paper --list shows the recorded ones)"
+            )
+            raise typer.Exit(code=2)
+    console.print("[bold green]SOLANA SNIPER — WEB DASHBOARD (read-only)[/]", highlight=False)
+    console.print(f"runtime home:      {home} ({home_source()})", highlight=False)
+    console.print(f"listening on:      {plan.url}", highlight=False)
+    if plan.exposed:
+        console.print(
+            f"[bold yellow]WARNING:[/] bound to {plan.host}: anyone who can reach this address "
+            "can read the dashboard. Prefer the default 127.0.0.1 and Tailscale/SSH.",
+            highlight=False,
+        )
+    console.print(
+        "[bold red]Real transactions: DISABLED[/] — the page cannot confirm, sign, broadcast or "
+        "change anything. Stop with Ctrl+C.",
+        highlight=False,
+    )
+    if print_command:
+        console.print(plan.display, highlight=False)
+        return
+    code = run_plan(plan)
+    if code not in (0, 130):
+        raise typer.Exit(code=code)
+
+
 service_app = typer.Typer(
     help="Background macOS service (launchd). Thin wrappers around ./start.sh, ./stop.sh, ..."
 )

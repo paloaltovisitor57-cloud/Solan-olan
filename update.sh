@@ -18,7 +18,7 @@ else
   info "updated $before → $after"
 fi
 info "updating dependencies"
-pip_install -e "${REPO_DIR}[dev]"
+pip_install -e "${REPO_DIR}[dev,web]"
 info "validating configuration"
 "$(venv_bin solana-sniper)" config-check || fail "configuration invalid after update; service NOT restarted"
 info "running migrations"

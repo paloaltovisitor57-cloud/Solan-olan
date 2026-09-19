@@ -71,6 +71,15 @@ solana-sniper --paper <session-id> portfolio
 solana-sniper --paper <session-id> evaluate      # outcome hit rates of that experiment (§12)
 ```
 
+Watch a session in the browser (read-only, this Mac only by default):
+
+```bash
+solana-sniper dashboard-web                       # http://localhost:8501, picks the running session
+solana-sniper dashboard-web --paper <session-id>  # open one paper experiment first
+```
+
+See "Web dashboard (read-only)" below for what it shows and what it can never do.
+
 The background service (launchd) remains available and secondary:
 `solana-sniper service start|stop|restart|status|logs|install` wrap the scripts below.
 
@@ -144,7 +153,8 @@ src/solana_sniper/
   storage/      SQLAlchemy async models, repository, serialization
   telemetry/    structlog logging, metrics, pipeline latency timers
   infra/        rate-limited HTTP client, reconnecting WebSocket, backoff
-tests/unit, tests/integration, tests/fixtures
+  web/          read-only Streamlit dashboard: session discovery, read-only SQLite reader, pages
+tests/unit, tests/integration, tests/web, tests/fixtures
 configs/default.yaml   configs/synthetic.yaml
 ```
 
@@ -250,6 +260,7 @@ solana-sniper evaluate                      # what happened after each decision 
 solana-sniper paper --bankroll-sol 1        # PAPER: live data, simulated fills, isolated session (start here)
 solana-sniper smoke-test                    # real-network provider check with latency and rate-limit advice
 solana-sniper service status|start|stop     # background launchd service (wrappers around the scripts)
+solana-sniper dashboard-web                 # read-only web dashboard on http://localhost:8501 (§11c)
 solana-sniper --home ~/somewhere status     # explicit runtime home; default = the service's platform home
 solana-sniper replay <SESSION_ID>           # re-run recorded observations through the engine
 solana-sniper doctor                        # config, db, network, providers, credentials, quote test
@@ -469,6 +480,76 @@ solana-sniper --paper <session> entry-attempts -v     # full trail per attempt
 solana-sniper --paper <session> inspect <MINT>        # attempts first, then the recorded history
 ```
 
+## 11c. Web dashboard (read-only)
+
+```bash
+solana-sniper dashboard-web                          # 127.0.0.1:8501, opens the browser
+solana-sniper dashboard-web --paper <session-id>     # start on one paper experiment
+solana-sniper dashboard-web --session <session-id>   # start on a live / dry-run session
+solana-sniper dashboard-web --port 8600 --refresh-seconds 5 --no-browser
+solana-sniper --home ~/somewhere dashboard-web       # another runtime home
+```
+
+`dashboard-web` starts a Streamlit page over the recorded sessions of the runtime home. It is a
+viewer, nothing else:
+
+* **Read-only by construction.** The web process opens every database with SQLite's `mode=ro`
+  URI and `PRAGMA query_only`, on short-lived connections, with a busy timeout and no explicit
+  transactions, so it never blocks the engine's WAL writer and the writer never blocks it. It
+  runs no `create_all` and no migration: a database older than schema version 4 is shown as
+  "unsupported schema, run `solana-sniper migrate`", never migrated from the browser. The page
+  has no BUY/SELL/confirm/cancel button, no wallet, no key, no seed phrase, no signing, no
+  broadcasting, no config or bankroll editing, no command-file writes and no shell access: the
+  only controls are the session selector, the page selector, table filters and a token search
+  box. The dashboard process never imports the execution, quote, alert, engine, bootstrap or
+  command-file modules (`tests/web/test_boundary.py` checks the import graph and scans the page
+  sources for acting widgets and signing vocabulary on every run). It needs no credentials: the
+  databases and `<home>/state/status.json` are all it reads.
+* **Local only by default.** It binds to `127.0.0.1:8501`. `--host` can bind elsewhere and the
+  CLI warns loudly when it does; there is no tunnel, no ngrok, no public relay. To read it on
+  your phone, use Tailscale or an SSH port forward to the Mac; the dashboard does no networking
+  of its own.
+* **Sessions.** PAPER sessions are the databases under `<home>/db/paper/`, LIVE / DRY_RUN /
+  REPLAY sessions are the rows of the `sessions` table in `<home>/db/*.db`. The sidebar groups
+  them by mode, newest first; the running session (fresh heartbeat naming it) is selected by
+  default, `--paper` / `--session` override that.
+* **Provenance header on every page.** A live-data paper run shows
+  `PAPER · MARKET DATA: LIVE · EXECUTION: SIMULATED · REAL TRANSACTIONS: DISABLED`; a synthetic
+  run shows `PAPER / TEST · MARKET DATA: SYNTHETIC`; a live signal session shows
+  `LIVE / SIGNAL MODE · EXECUTION: MANUAL SIGNAL / ESTIMATED / USER-REPORTED ·
+  REAL TRANSACTIONS: NOT RECONCILED ON-CHAIN`. Market-data provenance is read from the session's
+  recorded outcomes, tokens and observations (the heartbeat only when nothing is recorded yet);
+  a live-data paper run is never labelled synthetic. Whether the engine is alive comes from the
+  heartbeat (`RUNNING` with the engine state, `ENDED`, or `NOT RUNNING` with the last write or
+  stop reason).
+* **Pages.** Overview (alive, equity, return, drawdown, positions, signals, fills, latest entry
+  attempt, provider badges, open positions, latest events; metric cards, no wide tables, phone
+  first), Equity (equity / cash / open value curve, drawdown, realized-unrealized-exposure; long
+  histories are downsampled inside SQLite and the maximum drawdown is computed from the full
+  history), Positions (open and closed, executable vs estimated value, provenance, units,
+  staleness, "verified on-chain: no"), Candidates (state, score, age, liquidity, 5-minute volume,
+  velocity, momentum, acceleration, data age, check verdict, gate reason; active states
+  highlighted), Entry attempts (decision badges BUY_SIGNAL / ABANDONED / EXPIRED / HARD_REJECT /
+  QUOTE_FAILED / SIZING_ZERO / STALE / CANCELLED / PENDING and the full forensic record of each
+  latch window, filterable by decision), Signals (display only), Fills (simulated vs estimated /
+  user-reported, never verified), Token inspector (search by mint or symbol: metadata,
+  transition timeline, score history chart, features, checks, quotes, attempts, signals, fills,
+  outcomes, price/liquidity chart), Outcomes (the same buckets, Wilson intervals and warnings as
+  `solana-sniper evaluate`, with the same "no claim of profitability" wording), Providers
+  (governor health from the heartbeat), Engine (heartbeat, ticks, uptime, counters, storage
+  queue/dropped/failed, persisted write-integrity with the DATA INTEGRITY COMPROMISED banner),
+  Events (transitions, signals, fills, milestones, errors; filters ALL / TRADING / DATA /
+  PROVIDERS / ERRORS).
+* **Refresh.** Auto-refresh every 2–30 s (default 3, `--refresh-seconds`, adjustable in the
+  sidebar) through a Streamlit fragment; queries are cached for two seconds per viewer so a
+  running session is never shown frozen. A transient `SQLITE_BUSY` is retried and then shown as
+  "Database busy — retrying" while the last good data stays on screen.
+* **Secrets.** Every free-text field (error messages, quote errors, provider errors, exception
+  messages) passes through the same redaction as the logs before it reaches the page.
+
+The dashboard needs the `web` extra (`streamlit`, `plotly`, `pandas`); `install-macos.sh` and
+`update.sh` install it. Without it, `dashboard-web` exits with the install hint.
+
 ## 12. Outcome measurement (`evaluate`)
 
 The engine cannot know which token will go up. What it can do is record, for every candidate it
@@ -553,7 +634,7 @@ exits 0 only for HEALTHY.
 ## 14. Quality gates
 
 ```bash
-pytest            # unit + integration (synthetic end-to-end, invariants, recovery)
+pytest            # unit + integration (synthetic end-to-end, invariants, recovery) + web dashboard
 ruff check .
 mypy              # --strict via pyproject
 ```

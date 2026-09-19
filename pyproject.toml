@@ -23,6 +23,13 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# read-only web dashboard (`solana-sniper dashboard-web`); pandas is a Streamlit dependency
+# that the pages use directly for tables
+web = [
+  "streamlit>=1.45,<2",
+  "plotly>=5.24",
+  "pandas>=2.2",
+]
 dev = [
   "pytest>=8",
   "pytest-asyncio>=0.23",
@@ -30,6 +37,10 @@ dev = [
   "mypy>=1.10",
   "ruff>=0.5",
   "types-PyYAML",
+  "pandas-stubs",
+  "streamlit>=1.45,<2",
+  "plotly>=5.24",
+  "pandas>=2.2",
 ]
 
 [project.scripts]
@@ -57,8 +68,11 @@ ignore = ["RUF012", "SIM108", "B008", "T201", "RUF001", "RUF002", "RUF003"]
 "src/solana_sniper/cli/main.py" = ["E501"]
 "src/solana_sniper/cli/commands.py" = ["E501"]
 "src/solana_sniper/app/doctor.py" = ["E501"]
+"src/solana_sniper/web/app.py" = ["E501"]
 # embeds shell scripts for the mocked-launchd deployment test
 "tests/integration/test_scripts.py" = ["E501"]
+# fixture builder for the web dashboard tests: long literal rows are clearer unbroken
+"tests/web/seed.py" = ["E501"]
 # real-clock end-to-end run against mocked live providers: polling with sleep is intended
 "tests/integration/test_live_pipeline_mocked.py" = ["E501", "ASYNC110"]
 
@@ -73,6 +87,10 @@ plugins = ["pydantic.mypy"]
 [[tool.mypy.overrides]]
 module = ["tests.*"]
 strict = true
+
+[[tool.mypy.overrides]]
+module = ["plotly.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

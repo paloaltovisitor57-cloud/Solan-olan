@@ -10,6 +10,7 @@ from __future__ import annotations
 
 FORBIDDEN_IMPORT_PREFIXES: tuple[str, ...] = (
     "solana_sniper.execution",
+    "solana_sniper.wallet",
     "solana_sniper.quotes",
     "solana_sniper.alerts",
     "solana_sniper.app.engine",

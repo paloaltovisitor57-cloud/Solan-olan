@@ -18,6 +18,7 @@ from solana_sniper.domain.enums import (
     EntryDecision,
     ExitReason,
     FillProvenance,
+    IntentStatus,
     LedgerEntryKind,
     SignalKind,
     SignalStatus,
@@ -424,9 +425,10 @@ class ManualDecision:
 class Fill:
     """A confirmed (or simulated) fill.
 
-    Never produced by broadcasting a transaction. `provenance` says where the numbers came from
-    and `verified_onchain` is always False in this software: a reported signature string is stored
-    as-is and is *not* evidence that the transaction exists or matches these amounts.
+    `provenance` says where the numbers came from. `verified_onchain` is True only for
+    VERIFIED_ONCHAIN fills, which autonomous mode builds from the confirmed transaction's balance
+    deltas; for every other provenance a reported signature string is stored as-is and is *not*
+    evidence that the transaction exists or matches these amounts.
 
     Token quantities carry both representations, derived from each other with `token_decimals`:
     `token_amount_ui` (human units) and `token_amount_raw` (integer base units).
@@ -449,16 +451,21 @@ class Fill:
     simulated: bool
     units: TokenUnits = TokenUnits.UI
     reported_tx_signature: str | None = None  # user-supplied text, unverified
-    verified_onchain: bool = False  # reserved; this software never sets it
+    verified_onchain: bool = False  # True exactly for VERIFIED_ONCHAIN (on-chain reconciler)
     note: str = ""
+    tx_signature: str | None = None  # confirmed signature; required for VERIFIED_ONCHAIN
 
     def __post_init__(self) -> None:
         if self.simulated != (self.provenance is FillProvenance.SIMULATED):
             raise ValueError("Fill.simulated must agree with provenance")
-        if self.verified_onchain:
+        verified = self.provenance is FillProvenance.VERIFIED_ONCHAIN
+        if self.verified_onchain != verified:
             raise ValueError(
-                "Fill.verified_onchain cannot be set: no on-chain reconciliation exists"
+                "Fill.verified_onchain must be True exactly for VERIFIED_ONCHAIN fills, which "
+                "only the on-chain reconciler of autonomous mode produces"
             )
+        if verified and not self.tx_signature:
+            raise ValueError("a VERIFIED_ONCHAIN fill must carry its confirmed tx_signature")
         if self.units is TokenUnits.UI:
             check_decimals(self.token_decimals)
             if self.token_amount_ui < 0 or self.token_amount_raw < 0:
@@ -468,7 +475,7 @@ class Fill:
 
     @property
     def is_verified(self) -> bool:
-        return False
+        return self.verified_onchain
 
 
 @dataclass(slots=True)
@@ -511,8 +518,9 @@ class Position:
 
     @property
     def is_verified(self) -> bool:
-        """Always False: no fill recorded by this software is reconciled against the chain."""
-        return False
+        """True only when every fill of the position was reconciled on chain (autonomous
+        mode); the weakest fill decides."""
+        return self.provenance is FillProvenance.VERIFIED_ONCHAIN
 
     @property
     def units_known(self) -> bool:
@@ -651,6 +659,61 @@ class EntryAttempt:
         )
         self.max_score_seen = (
             score if self.max_score_seen is None else max(self.max_score_seen, score)
+        )
+
+
+@dataclass(slots=True)
+class ExecutionIntent:
+    """Durable record of one autonomous swap, written before anything is signed or sent.
+
+    The signature is known as soon as the transaction is signed (BUILT), so a crash at any later
+    point can be reconciled by asking the chain about that signature; nothing is ever sent twice.
+    Amounts are integers in base units (lamports / raw token units) exactly as the chain sees
+    them; the EUR view lives on the Fill built from the confirmed transaction."""
+
+    intent_id: str
+    session_id: str
+    signal_id: str
+    order_id: str
+    mint: str
+    symbol: str | None
+    side: SignalKind
+    created_at: datetime
+    updated_at: datetime
+    wallet_public_key: str
+    status: IntentStatus = IntentStatus.PREPARED
+    quote_id: str | None = None
+    in_amount_raw: int = 0  # buy: lamports spent; sell: raw tokens sold
+    expected_out_raw: int = 0
+    min_out_raw: int = 0
+    slippage_bps: int = 0
+    price_impact_pct: float = 0.0
+    priority_fee_lamports: int = 0
+    signature: str | None = None
+    last_valid_block_height: int | None = None
+    sent_at: datetime | None = None
+    confirmed_at: datetime | None = None
+    slot: int | None = None
+    attempts: int = 0
+    error: str | None = None
+    fill_id: str | None = None
+    position_id: str | None = None
+    sol_delta_lamports: int | None = None  # confirmed: owner lamport delta (includes the fee)
+    token_delta_raw: int | None = None  # confirmed: owner token delta for the mint
+    fee_lamports: int | None = None
+    token_decimals: int | None = None
+
+    @property
+    def in_flight(self) -> bool:
+        return self.status in (IntentStatus.BUILT, IntentStatus.SENT)
+
+    @property
+    def terminal(self) -> bool:
+        return self.status in (
+            IntentStatus.CONFIRMED,
+            IntentStatus.FAILED,
+            IntentStatus.EXPIRED,
+            IntentStatus.ABANDONED,
         )
 
 

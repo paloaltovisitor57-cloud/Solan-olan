@@ -92,15 +92,18 @@ class DecisionSource(StrEnum):
     HUMAN = "HUMAN"
     DRY_RUN = "DRY_RUN"
     SYSTEM = "SYSTEM"
+    AUTONOMOUS = "AUTONOMOUS"  # the bot itself, in autonomous mode (hot wallet)
 
 
 class FillProvenance(StrEnum):
-    """How a recorded fill came to exist. Nothing this software records is on-chain verified.
+    """How a recorded fill came to exist.
 
-    SIMULATED        dry-run auto-confirmation; no transaction ever existed
+    SIMULATED        dry-run/paper auto-confirmation; no transaction ever existed
     ESTIMATED        human confirmed, amounts taken from the quote (not from a wallet or chain)
     USER_REPORTED    human confirmed and typed the amounts / signature they saw in their wallet
-    VERIFIED_ONCHAIN reserved for a future reconciliation adapter; never set by this software
+    VERIFIED_ONCHAIN autonomous mode: the bot signed and broadcast the swap and the amounts were
+                     read back from the confirmed transaction (the only provenance that is
+                     reconciled against the chain; set only by the on-chain reconciler)
     UNKNOWN_LEGACY   record written before provenance existed; migration flags it, never upgrades it
     """
 
@@ -163,10 +166,11 @@ class MarketDataProvenance(StrEnum):
 
 
 class ExecutionProvenance(StrEnum):
-    """How fills were produced (never on-chain in this software)."""
+    """How fills were produced."""
 
     SIMULATED = "SIMULATED"  # paper/dry-run: simulated confirmations and fills
     MANUAL_SIGNAL = "MANUAL_SIGNAL"  # live signal mode: a human confirms every fill
+    AUTONOMOUS = "AUTONOMOUS"  # autonomous mode: bot-signed swaps, fills reconciled on-chain
 
 
 class EntryDecision(StrEnum):
@@ -184,7 +188,20 @@ class EntryDecision(StrEnum):
 
 
 class RunMode(StrEnum):
-    LIVE = "LIVE"
+    LIVE = "LIVE"  # live signal mode: a human executes and confirms every trade
     DRY_RUN = "DRY_RUN"
     PAPER = "PAPER"  # live data, simulated fills, isolated per-session database
     REPLAY = "REPLAY"
+    AUTONOMOUS = "AUTONOMOUS"  # live data, the bot signs and broadcasts from its hot wallet
+
+
+class IntentStatus(StrEnum):
+    """Lifecycle of one autonomous execution intent (durable before anything is sent)."""
+
+    PREPARED = "PREPARED"  # rails passed, quote in progress, nothing built yet
+    BUILT = "BUILT"  # transaction built and signed; signature known; not yet sent
+    SENT = "SENT"  # sendTransaction acknowledged (or possibly received); awaiting confirmation
+    CONFIRMED = "CONFIRMED"  # confirmed on chain and reconciled into a fill
+    FAILED = "FAILED"  # rejected by preflight/the network, or the transaction errored on chain
+    EXPIRED = "EXPIRED"  # blockhash expired before confirmation; the transaction cannot land
+    ABANDONED = "ABANDONED"  # rails or quote drift stopped it before anything was sent

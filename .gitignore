@@ -17,3 +17,7 @@ data/
 .env.*
 !.env.example
 sniper.env
+# hot wallet key files (autonomous mode); the runtime home is outside the repo, but never risk it
+wallet/
+*.keypair.json
+hot-wallet*.json

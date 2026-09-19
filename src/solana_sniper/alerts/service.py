@@ -8,8 +8,9 @@ from __future__ import annotations
 from decimal import Decimal
 
 from solana_sniper.alerts.base import Alert, AlertProvider
-from solana_sniper.domain.enums import Urgency
+from solana_sniper.domain.enums import FillProvenance, Urgency
 from solana_sniper.domain.events import (
+    AutonomyDisarmed,
     BuySignalCreated,
     ErrorOccurred,
     Event,
@@ -17,6 +18,9 @@ from solana_sniper.domain.events import (
     PositionClosed,
     PositionOpened,
     SellSignalCreated,
+    TransactionConfirmed,
+    TransactionFailed,
+    TransactionSent,
 )
 from solana_sniper.domain.money import q_display
 from solana_sniper.telemetry.logging import get_logger
@@ -89,7 +93,7 @@ class AlertService:
                 at=p.opened_at,
                 title=f"OPENED {p.symbol or p.mint[:6]}",
                 body=f"qty {p.quantity_ui:,.0f} cost €{q_display(p.cost_basis_eur)} "
-                f"[{p.provenance}, unverified]",
+                f"[{p.provenance}, {_verification(p.provenance)}]",
                 urgency=Urgency.NORMAL,
                 category="position",
             )
@@ -102,7 +106,7 @@ class AlertService:
                 at=p.closed_at or p.opened_at,
                 title=f"CLOSED {p.symbol or p.mint[:6]} {sign}€{q_display(pnl)}",
                 body=f"exit €{q_display(exit_value)} ({p.exit_reason}) pnl {p.pnl_pct:+.0%} "
-                f"[{p.provenance}, unverified]",
+                f"[{p.provenance}, {_verification(p.provenance)}]",
                 urgency=Urgency.NORMAL,
                 category="position",
             )
@@ -124,4 +128,54 @@ class AlertService:
                 urgency=Urgency.NORMAL,
                 category="error",
             )
+        if isinstance(event, TransactionSent):
+            i = event.intent
+            return Alert(
+                at=i.sent_at or i.updated_at,
+                title=f"SENT {i.side} {i.symbol or i.mint[:6]} (real transaction)",
+                body=(
+                    f"signature {i.signature} | in {i.in_amount_raw} raw | "
+                    f"expected out {i.expected_out_raw} raw | slippage {i.slippage_bps}bps | "
+                    f"wallet {i.wallet_public_key[:8]}…"
+                ),
+                urgency=Urgency.HIGH,
+                category="autonomy",
+            )
+        if isinstance(event, TransactionConfirmed):
+            i, f = event.intent, event.fill
+            return Alert(
+                at=f.filled_at,
+                title=f"CONFIRMED {i.side} {i.symbol or i.mint[:6]} on chain",
+                body=(
+                    f"{f.sol_amount} SOL ↔ {f.token_amount_ui:,.4f} tokens | fee €{f.fee_eur} | "
+                    f"signature {f.tx_signature} | slot {i.slot}"
+                ),
+                urgency=Urgency.HIGH,
+                category="autonomy",
+            )
+        if isinstance(event, TransactionFailed):
+            i = event.intent
+            return Alert(
+                at=i.updated_at,
+                title=f"{i.status} {i.side} {i.symbol or i.mint[:6]}",
+                body=event.reason + (f" | signature {i.signature}" if i.signature else ""),
+                urgency=Urgency.URGENT,
+                category="autonomy",
+            )
+        if isinstance(event, AutonomyDisarmed):
+            return Alert(
+                at=event.at,
+                title="AUTONOMY DISARMED",
+                body=f"{event.reason}. No new buys until `solana-sniper arm` is run again.",
+                urgency=Urgency.URGENT,
+                category="autonomy",
+            )
         return None
+
+
+def _verification(provenance: FillProvenance) -> str:
+    return (
+        "verified on-chain"
+        if provenance is FillProvenance.VERIFIED_ONCHAIN
+        else "not verified on-chain"
+    )

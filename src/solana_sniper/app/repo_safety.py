@@ -21,9 +21,11 @@ MUST_IGNORE: tuple[str, ...] = (
     "data/sniper.db",
     "data/state/status.json",
     "logs/sniper.log",
+    "wallet/hot-wallet.json",
+    "data/wallet/hot-wallet.json",
 )
 # Paths that must never be tracked, even if a later .gitignore edit would ignore them.
-MUST_NOT_TRACK: tuple[str, ...] = (".env", "sniper.env", "data", "logs/sniper.log")
+MUST_NOT_TRACK: tuple[str, ...] = (".env", "sniper.env", "data", "logs/sniper.log", "wallet")
 
 
 @dataclass(frozen=True, slots=True)

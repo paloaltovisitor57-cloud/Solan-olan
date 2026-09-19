@@ -11,6 +11,7 @@ from solana_sniper.domain.models import (
     CheckReport,
     EntryScore,
     ErrorRecord,
+    ExecutionIntent,
     ExecutionRecord,
     FeatureVector,
     Fill,
@@ -141,6 +142,37 @@ class ErrorOccurred:
 
 
 @dataclass(frozen=True, slots=True)
+class TransactionSent:
+    """Autonomous mode broadcast a signed swap (real money in flight)."""
+
+    intent: ExecutionIntent
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionConfirmed:
+    """The swap confirmed on chain and its amounts were read back into `fill`."""
+
+    intent: ExecutionIntent
+    fill: Fill
+
+
+@dataclass(frozen=True, slots=True)
+class TransactionFailed:
+    """The swap was abandoned, rejected, expired or errored; `reason` is already scrubbed."""
+
+    intent: ExecutionIntent
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomyDisarmed:
+    """A safety rail disarmed autonomous trading (no new buys until re-armed)."""
+
+    at: datetime
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
 class LogLine:
     at: datetime
     level: str
@@ -169,5 +201,9 @@ Event = (
     | MilestoneReached
     | ExecutionPrepared
     | ErrorOccurred
+    | TransactionSent
+    | TransactionConfirmed
+    | TransactionFailed
+    | AutonomyDisarmed
     | LogLine
 )

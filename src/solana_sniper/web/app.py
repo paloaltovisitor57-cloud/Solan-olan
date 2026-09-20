@@ -33,6 +33,7 @@ from solana_sniper.web.data import (
 )
 from solana_sniper.web.models import (
     EVENT_CATEGORIES,
+    AutonomyHealth,
     CandidateView,
     EngineHealth,
     EquityHistory,
@@ -464,8 +465,9 @@ def page_positions(ctx: Ctx, summary: SessionSummary) -> None:
     st.caption(
         "Value is executable when it comes from a fresh sell quote, otherwise it is an estimate "
         "from the displayed price. Provenance SIMULATED = paper/dry-run fill; ESTIMATED = human "
-        "confirmed at quoted amounts; USER-REPORTED = amounts typed by the user. No position is "
-        "verified on-chain."
+        "confirmed at quoted amounts; USER-REPORTED = amounts typed by the user; "
+        "VERIFIED_ONCHAIN = an autonomous session read the fill back from the confirmed "
+        "transaction. Only those last positions are verified on-chain."
     )
 
 
@@ -475,7 +477,7 @@ def _position_detail(p: PositionView) -> None:
         f"{ui.badge('units ' + p.units, 'gray')} "
         f"{ui.badge('EXECUTABLE VALUE' if p.value_is_executable else 'ESTIMATED VALUE', 'green' if p.value_is_executable else 'orange')} "
         f"{ui.badge('DATA STALE', 'orange') if p.data_stale else ''} "
-        f"{ui.badge('VERIFIED ON-CHAIN: NO', 'red')}"
+        f"{ui.badge('VERIFIED ON-CHAIN: YES', 'green') if p.verified_onchain else ui.badge('VERIFIED ON-CHAIN: NO', 'red')}"
     )
     ui.kv_block(
         [
@@ -763,10 +765,13 @@ def _fill_rows(items: list[FillView]) -> list[dict[str, Any]]:
             "fee €": float(f.fee_eur) if f.fee_eur is not None else None,
             "slippage €": float(f.slippage_cost_eur) if f.slippage_cost_eur is not None else None,
             "provenance": f.provenance,
-            "kind": "simulated" if f.simulated else "estimated / user-reported",
+            "kind": "verified on-chain"
+            if f.verified_onchain
+            else ("simulated" if f.simulated else "estimated / user-reported"),
             "units": f.units,
+            "verified on-chain": "yes" if f.verified_onchain else "no",
+            "signature": f.tx_signature or "",
             "reported signature": f.reported_tx_signature or "",
-            "verified on-chain": "no",
             "note": f.note,
             "signal": f.signal_id,
             "mint": f.mint,
@@ -780,10 +785,12 @@ def page_fills(ctx: Ctx, summary: SessionSummary) -> None:
     if items is None:
         return
     sim = sum(1 for f in items if f.simulated)
+    verified = sum(1 for f in items if f.verified_onchain)
     st.markdown(
         f"{ui.badge('SIMULATED', 'gray')} {sim}  "
-        f"{ui.badge('ESTIMATED / USER-REPORTED', 'orange')} {len(items) - sim}  "
-        f"{ui.badge('VERIFIED ON-CHAIN', 'red')} 0 (never; this software does not reconcile fills)"
+        f"{ui.badge('ESTIMATED / USER-REPORTED', 'orange')} {len(items) - sim - verified}  "
+        f"{ui.badge('VERIFIED ON-CHAIN', 'red' if verified else 'gray')} {verified} "
+        "(only an autonomous session reads fills back from the chain)"
     )
     ui.table(
         _fill_rows(items),
@@ -1154,9 +1161,16 @@ def page_engine(ctx: Ctx, summary: SessionSummary) -> None:
                     "database",
                     "ok" if eh.db_ok else f"write failures ({eh.db_last_error or 'unknown'})",
                 ),
-                ("records verified on-chain", "never (no reconciliation exists)"),
+                (
+                    "records verified on-chain",
+                    "yes (autonomous fills read back from the chain)"
+                    if eh.records_verified_onchain
+                    else "no (this session has no reconciled fills)",
+                ),
             ]
         )
+        if eh.autonomy is not None:
+            _autonomy_section(eh.autonomy)
         if eh.db_integrity:
             with st.expander("storage integrity (live counters)"):
                 ui.table([{"key": k, "value": str(v)} for k, v in eh.db_integrity.items()])
@@ -1183,6 +1197,47 @@ def page_engine(ctx: Ctx, summary: SessionSummary) -> None:
                 ("last error", eh.integrity.last_error or "—"),
             ]
         )
+
+
+def _autonomy_section(a: AutonomyHealth) -> None:
+    ui.section("autonomous execution")
+    if a.kill_switch:
+        flag = ui.badge("KILL SWITCH ACTIVE", "red")
+    elif a.armed:
+        flag = ui.badge("ARMED", "red")
+    else:
+        flag = ui.badge("DISARMED", "orange")
+    st.markdown(f"{flag} {ui.badge('HOT WALLET', 'red')} {a.state}")
+    if a.disarmed_reason:
+        st.warning(f"disarmed: {a.disarmed_reason} (no new buys; exits continue)")
+    caps = a.caps
+    ui.kv_block(
+        [
+            ("wallet", a.wallet_public_key or "—"),
+            (
+                "balance",
+                f"{a.wallet_sol} SOL (checked {ui.since(a.wallet_checked_at)})"
+                if a.wallet_sol
+                else "unknown",
+            ),
+            ("spent today", f"{a.spent_today_sol or '0'} SOL"),
+            ("loss / limit", f"{a.loss_sol or '?'} / {a.max_total_loss_sol or '?'} SOL"),
+            (
+                "caps",
+                f"per trade ≤ {caps.get('max_trade_sol', '?')} SOL · per day ≤ "
+                f"{caps.get('max_daily_spend_sol', '?')} SOL · open positions ≤ "
+                f"{caps.get('max_open_positions', '?')} · reserve {caps.get('reserve_sol', '?')} SOL",
+            ),
+            ("in flight", str(a.intents_in_flight)),
+            ("sends / confirmed / failed", f"{a.sends} / {a.confirmed} / {a.failed}"),
+            ("last send", ui.since(a.last_send_at)),
+            ("last confirmed", ui.since(a.last_confirmed_at)),
+        ]
+    )
+    st.caption(
+        "Stop from a terminal: `solana-sniper kill` (buys and sells), `solana-sniper disarm` "
+        "(buys only). This page cannot do either."
+    )
 
 
 def page_events(ctx: Ctx, summary: SessionSummary) -> None:
@@ -1301,10 +1356,7 @@ def main() -> None:
         st.markdown("### ◆ SOLANA SNIPER")
         st.caption(f"read-only dashboard v{__version__}")
         st.caption(f"runtime home `{cfg.home}`")
-        st.markdown(
-            f"{ui.badge('READ-ONLY', 'blue')} {ui.badge('NO KEYS', 'red')} "
-            f"{ui.badge('NO SIGNING', 'red')} {ui.badge('NO BROADCAST', 'red')}"
-        )
+        st.markdown(f"{ui.badge('READ-ONLY PAGE', 'blue')} {ui.badge('NO KEYS HERE', 'red')}")
     try:
         refs = cached_sessions(str(cfg.home), running)
     except DashboardError as exc:
@@ -1322,6 +1374,13 @@ def main() -> None:
         st.info("No session selected.")
         return
     with st.sidebar:
+        if ref.mode.upper() == "AUTONOMOUS":
+            st.markdown(
+                f"{ui.badge('HOT WALLET ACTIVE', 'red')} "
+                f"{ui.badge('THE ENGINE SIGNS, THIS PAGE CANNOT', 'gray')}"
+            )
+        else:
+            st.markdown(f"{ui.badge('NO SIGNING', 'red')} {ui.badge('NO BROADCAST', 'red')}")
         auto = st.toggle("auto-refresh", value=True, key="auto_refresh")
         refresh = st.slider(
             "refresh seconds", MIN_REFRESH_S, MAX_REFRESH_S, cfg.refresh_seconds, key="refresh_s"

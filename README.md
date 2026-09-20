@@ -3,22 +3,31 @@
 Live Solana new-token trading engine in Python 3.12: continuous discovery of freshly launched
 tokens, real-time market data, token checks, short-horizon features, 0–100 entry scoring,
 dynamic bankroll-based position sizing, executable round-trip quotes, **manual-confirm** BUY/SELL
-signals, tick-by-tick position monitoring with adaptive trailing exits, an auditable ledger, a
-terminal dashboard, SQLite persistence with restart recovery, replay and a `doctor` command.
+signals or, once armed, **autonomous execution from a dedicated hot wallet** with every fill read
+back from the confirmed transaction, tick-by-tick position monitoring with adaptive trailing exits,
+an auditable ledger, a terminal dashboard, a read-only web dashboard, SQLite persistence with
+restart recovery, replay and a `doctor` command.
 
-> **Execution boundary.** The engine never asks for, stores or uses a private key, never signs and
-> never broadcasts a transaction. Every real-money action is a *recommendation* that a human confirms
-> with `b N` / `s N`. Where enabled, it can prepare an **unsigned** Jupiter swap transaction for the
-> configured **public** key so the user can sign it in their own wallet. Invariant tests grep the
-> source tree for signing/broadcast code paths and fail if any appear.
+> **Execution boundary.** Paper, dry-run, replay and live *signal* mode never ask for, store or use
+> a private key, never sign and never broadcast: every real-money action is a *recommendation* that
+> a human confirms with `b N` / `s N` (optionally with an **unsigned** Jupiter swap prepared for the
+> configured **public** key). **Autonomous mode** is the one exception, and it is explicit: it holds
+> exactly one key, a *dedicated hot wallet* that `solana-sniper wallet create` generates into a
+> 0600 file under the runtime home (your own wallet's key is never involved), it is off until
+> `solana-sniper arm` records a loss limit, and it only runs when started with `run --autonomous`.
+> All signing and broadcast code lives in `src/solana_sniper/wallet/` and
+> `execution/autonomous.py`; an invariant test greps the rest of the tree and fails if signing
+> vocabulary appears anywhere else, and a second test proves the other modes never construct a
+> signer even with a key file configured.
 >
-> **Provenance of every figure.** Nothing this software records is reconciled against the chain.
-> Each fill, position and ledger entry carries a `provenance`: `SIMULATED` (dry-run),
-> `ESTIMATED` (a human confirmed and the amounts were taken from the quote), `USER_REPORTED` (the
-> human typed the amounts / a signature string they saw in their wallet) or `UNKNOWN_LEGACY`
-> (recorded before provenance existed). A reported signature is stored verbatim and is **not**
-> treated as verification; `verified_onchain` is always `false`. Dashboard, `positions`,
-> `portfolio`, `status` and the heartbeat all say so.
+> **Provenance of every figure.** Each fill, position and ledger entry carries a `provenance`:
+> `SIMULATED` (paper / dry-run), `ESTIMATED` (a human confirmed and the amounts were taken from the
+> quote), `USER_REPORTED` (the human typed the amounts / a signature they saw in their wallet),
+> `VERIFIED_ONCHAIN` (autonomous mode: the amounts are the balance deltas of the confirmed
+> transaction, signature stored) or `UNKNOWN_LEGACY` (recorded before provenance existed). A
+> reported signature is stored verbatim and is **not** verification; `verified_onchain` is `true`
+> only on `VERIFIED_ONCHAIN` records, and only the autonomous reconciler can write those.
+> Dashboard, `positions`, `portfolio`, `status` and the heartbeat all say which is which.
 >
 > **Software tests are not investment evidence.** The test suite proves that the pipeline, the
 > accounting and the safety invariants behave as specified on synthetic and mocked data. Equity
@@ -85,6 +94,87 @@ The background service (launchd) remains available and secondary:
 
 ---
 
+## AUTONOMOUS TRADING (real money, dedicated hot wallet)
+
+Autonomous mode lets the engine execute its own signals: for every BUY/SELL it re-quotes,
+builds, signs and broadcasts a swap from a **hot wallet that the tool generates for this
+purpose**, waits for confirmation, and books the fill from the confirmed transaction's balance
+deltas. It is off by default, cannot switch itself on, and can lose everything in that wallet.
+Run paper mode first (above); autonomous mode is the same pipeline with real execution.
+
+```bash
+solana-sniper wallet create              # 1. prints a fresh address; key file <home>/wallet/hot-wallet.json (mode 600)
+#   send SOL to that address from any wallet: only what you can afford to lose
+solana-sniper arm --max-loss-sol 0.1     # 2. reads the balance, records the loss limit + caps, enables autonomy in sniper.env
+solana-sniper run --autonomous           # 3. trades until Ctrl+C / kill / disarm (service: SNIPER_SERVICE_MODE=autonomous)
+
+solana-sniper kill                       # emergency stop: no buys and no sells (./cmd.sh kill reaches the headless service)
+solana-sniper disarm                     # no new buys; open positions are still managed and sold
+solana-sniper resume                     # lift the kill switch (`arm` re-arms after a disarm)
+solana-sniper wallet show                # address, balance, arming state, what is still missing
+solana-sniper wallet import <file>       # instead of `create`: a Solana CLI JSON array or base58 export (never a seed phrase)
+```
+
+* **Setup is three commands and nothing else.** `wallet create` writes the key file (0600, in a
+  0700 directory, owned by your user; refuses to overwrite) and puts *its path* into
+  `sniper.env` as `SNIPER_WALLET__KEY_FILE`. `arm` loads the wallet, reads its balance over the
+  RPC, refuses a balance at or below the fee reserve, prints the caps and a red warning, asks for
+  confirmation (`--yes` skips it), then writes `SNIPER_AUTONOMY__ENABLED`,
+  `ACKNOWLEDGE_REAL_MONEY`, `MAX_TOTAL_LOSS_SOL`, `MAX_TRADE_SOL`, `MAX_DAILY_SPEND_SOL`,
+  `MAX_OPEN_POSITIONS` into `sniper.env` and `state/armed.json` (starting balance, limit, caps).
+  `run --autonomous` refuses to start unless a wallet loads, autonomy is enabled and
+  acknowledged in the configuration and an arming decision is on record; it then prints
+  `LIVE AUTONOMOUS MODE` with the address, balance, arming state and caps. `--dry-run` and
+  `--autonomous` are mutually exclusive.
+* **Hard caps, enforced in code before every send** (`wallet/rails.py`): per-trade SOL
+  (`autonomy.max_trade_sol`, default 0.05), SOL spent on buys per UTC day (0.5), open positions
+  (2), a fee reserve the wallet never spends below (0.02), maximum slippage (300 bps) and price
+  impact (3 %), a priority-fee ceiling, a confirmation timeout, and a re-quote drift limit (a
+  fresh quote more than 2 % worse than the signal's abandons the order). The **total loss limit**
+  has no default: `arm --max-loss-sol` sets it, and loss = starting balance − (wallet balance +
+  open positions at the current SOL rate). When it trips the engine **auto-disarms**: no new
+  buys, exits continue (`autonomy.exits_continue_when_disarmed`), an URGENT alert is sent and
+  `state/disarmed.json` records why. Nothing here is a profit guarantee; the caps bound how fast
+  money can leave, not whether it does.
+* **Disarm vs kill.** `disarm` (or the loss limit) stops buys; positions are still monitored and
+  sold by the exit engine. `kill` writes `state/KILL`, which stops buys *and* sells within one
+  tick, so open positions stay open and unmanaged until `resume`. Both work from the terminal,
+  from `./cmd.sh`, and from the TUI (`kill`, `disarm [reason]`, `resume`, `a` for the state).
+  `b N` / `s N` do not apply in autonomous mode: fills come only from confirmed transactions.
+* **One send per intent, crash-safe.** Every order gets a durable `execution_intents` row
+  before anything is built; the transaction is signed first, so the signature is known before
+  broadcast; `sendTransaction` is sent exactly once with no HTTP retries (a transport error
+  after the request may have left the node is treated as *sent* and polled, never re-sent);
+  status is polled until confirmed, failed or the blockhash expired. On restart every BUILT/SENT
+  intent is reconciled by signature before the engine ticks: a swap that landed while the
+  process was down is booked as a position (or a close), one that never landed is marked
+  expired, and today's spend is rebuilt from confirmed buys.
+* **What "verified on-chain" means.** `VERIFIED_ONCHAIN` fills carry the confirmed signature
+  and amounts taken from `preBalances/postBalances` and the token balance deltas of the owner in
+  that transaction, with the network fee booked separately. Open-position *values* are still
+  quote estimates (they are what a sell would fetch now, not a chain fact). The heartbeat,
+  `status --json`, the TUI header and the web dashboard show `records_verified_onchain`, the
+  wallet address, balance, spend today, loss vs limit, in-flight intents and send/confirm/fail
+  counters (`autonomy` block).
+* **Threat model.** The hot wallet key is a file on this machine; anyone who can read it holds
+  the funds, so a compromised Mac equals a drained wallet. Keep only what you can lose in it,
+  never more than the loss limit you would accept, and back the key file up somewhere offline if
+  the balance matters (it is never displayed again). The key is never logged, never stored in
+  the database, never in the heartbeat and never in `sniper.env` (only its path is); the secret
+  is registered with the log redaction so an accidental print is masked; `doctor` checks the
+  file mode and the directory mode. Public RPC endpoints rate-limit and drop transactions: set
+  `SNIPER_PROVIDERS__SOLANA_RPC_URL` (or a dedicated `SNIPER_AUTONOMY__SEND_RPC_URL`) to a
+  Helius/QuickNode URL before arming; `arm` warns if you did not.
+* **Not done from this environment.** The autonomous path was proven offline end to end
+  (`tests/integration/test_autonomous_pipeline_mocked.py`: live provider composition with mocked
+  transports, a fake node that executes the signed transactions against the pool, a buy and a
+  sell booked from the chain, one broadcast per intent, the secret absent from database and
+  heartbeat) and unit-tested for every rail, failure and recovery path. It has **not** been run
+  against Solana mainnet from the build sandbox; the first real swap on your Mac is the first
+  real swap.
+
+---
+
 ## 1. Architecture
 
 ```
@@ -96,7 +186,7 @@ The background service (launchd) remains available and secondary:
  PumpPortal trades  ─────┼─▶ │ TokenTracker (rolling buffers, dedupe, stale detection) │
  (Synthetic world)  ─────┘   │  → FeatureEngine → TokenChecker → EntryScorer → Gate   │
                              │  → RiskEngine (size) → RoundTripEvaluator (Jupiter)    │
-                             │  → BuySignal → ExecutionInterface (manual / dry-run)   │
+                             │  → BuySignal → ExecutionInterface (manual/dry-run/auto)│
                              │  → PortfolioAccount (ledger) → PositionMonitor         │
                              │  → ExitEngine (adaptive trailing, momentum, liquidity, │
                              │     volume, max loss, timeout, abnormal, stale)        │
@@ -111,10 +201,12 @@ The background service (launchd) remains available and secondary:
 
 Key design points:
 
-* **One engine, three modes.** `run` (live signal mode, human confirms), `run --dry-run` (same
-  live data and logic, confirmations simulated after a delay with a pessimistic fill haircut) and
-  `replay SESSION_ID` (recorded observations on a manual clock). Only the `ExecutionInterface`
-  adapter and data sources differ; the engine code is identical.
+* **One engine, five modes.** `paper` (live data, simulated fills, isolated database), `run`
+  (live signal mode, human confirms), `run --dry-run` (same live data and logic, confirmations
+  simulated after a delay with a pessimistic fill haircut), `run --autonomous` (the bot signs and
+  broadcasts from its hot wallet, fills reconciled on-chain) and `replay SESSION_ID` (recorded
+  observations on a manual clock). Only the `ExecutionInterface` adapter and data sources differ;
+  the engine code is identical.
 * **Explicit state machine** per candidate: `DISCOVERED → MONITORING → QUALIFIED → BUY_SIGNAL →
   AWAITING_CONFIRMATION → OPEN → EXIT_SIGNAL → AWAITING_EXIT_CONFIRMATION → CLOSED`, plus
   `REJECTED`, `EXPIRED`, `DATA_STALE`, `SIGNAL_CANCELLED`. Transitions are table-driven and guarded;
@@ -146,7 +238,8 @@ src/solana_sniper/
   strategy/     entry scorer (0–100) and qualification gate
   risk/         dynamic sizing engine, bankroll tiers, profiles, hard limits, milestones
   quotes/       QuoteProvider + Jupiter adapter + round-trip evaluator
-  execution/    ExecutionInterface, manual + dry-run executors, unsigned-tx preparer
+  execution/    ExecutionInterface, manual + dry-run executors, unsigned-tx preparer, autonomous executor
+  wallet/       the only signing layer: hot wallet key file, send RPC client, on-chain reconciliation, safety rails
   positions/    position monitor, adaptive trailing, exit engine
   portfolio/    ledger accounting, FX (CoinGecko / static)
   alerts/       AlertProvider: terminal, Discord, Telegram
@@ -179,7 +272,11 @@ All optional. Prefix `SNIPER_`, nesting with `__`. Any YAML key can be overridde
 | `SNIPER_PROVIDERS__SOLANA_WS_URL` | RPC WebSocket (reserved for a future logs-subscribe discovery adapter) |
 | `SNIPER_PROVIDERS__HELIUS_API_KEY` | Enables DAS `getTokenAccounts` holder counts |
 | `SNIPER_PROVIDERS__JUPITER_API_KEY` | Uses `api.jup.ag` with higher rate limits; without it `lite-api.jup.ag` is used |
-| `SNIPER_PROVIDERS__WALLET_PUBLIC_KEY` | **Public** key only; enables unsigned swap preparation. Anything that looks like a secret is rejected at config load |
+| `SNIPER_PROVIDERS__WALLET_PUBLIC_KEY` | **Public** key only; enables unsigned swap preparation in signal mode. Anything that looks like a secret is rejected at config load |
+| `SNIPER_WALLET__KEY_FILE` | Path of the hot wallet key file for autonomous mode (written by `wallet create`). A value that looks like key material instead of a path is rejected |
+| `SNIPER_AUTONOMY__ENABLED` / `SNIPER_AUTONOMY__ACKNOWLEDGE_REAL_MONEY` | Both must be `true` for `run --autonomous`; `arm` sets them |
+| `SNIPER_AUTONOMY__MAX_TOTAL_LOSS_SOL`, `MAX_TRADE_SOL`, `MAX_DAILY_SPEND_SOL`, `MAX_OPEN_POSITIONS`, `RESERVE_SOL`, `MAX_SLIPPAGE_BPS`, `MAX_PRICE_IMPACT_PCT`, `MAX_PRIORITY_FEE_LAMPORTS`, `CONFIRM_TIMEOUT_S`, `REQUOTE_MAX_WORSE_PCT`, `EXITS_CONTINUE_WHEN_DISARMED` | The autonomous caps (see "AUTONOMOUS TRADING") |
+| `SNIPER_AUTONOMY__SEND_RPC_URL` | Optional dedicated endpoint for `sendTransaction`/status polling; defaults to `SOLANA_RPC_URL` and shares its rate limits |
 | `SNIPER_ALERTS__DISCORD_WEBHOOK_URL` | Push alerts (HIGH/URGENT by default) |
 | `SNIPER_ALERTS__TELEGRAM_BOT_TOKEN` / `SNIPER_ALERTS__TELEGRAM_CHAT_ID` | Push alerts |
 | `SNIPER_CONFIG` | Path of the YAML config (default `configs/default.yaml`) |
@@ -207,7 +304,7 @@ without being echoed.
 | GeckoTerminal `/networks/solana/new_pools` | new pools across Raydium/PumpSwap/Meteora/Orca with `pool_created_at` | none | 30 req/min, polled |
 | DexScreener `/tokens/v1/solana/{mints}` | batch market data (price, liquidity, volume, txns, mcap/fdv) 30 mints/request | none | 300 req/min; also `token-profiles`/`token-boosts` as optional discovery |
 | Solana JSON-RPC | `getAccountInfo` (mint/freeze authority, Token-2022 extensions), `getTokenLargestAccounts` (concentration) | optional | public RPC is rate-limited; Helius adds holder counts |
-| Jupiter `/swap/v1/quote`, `/swap/v1/swap` | executable quotes, round-trip test, exit valuation, **unsigned** tx | optional | never signed/broadcast by this software |
+| Jupiter `/swap/v1/quote`, `/swap/v1/swap` | executable quotes, round-trip test, exit valuation, swap build (unsigned tx for signal mode; the swap the hot wallet signs in autonomous mode) | optional | signed and broadcast only by `wallet/` in autonomous mode |
 | CoinGecko `/simple/price` | SOL→EUR, USD→EUR | none | static fallback in config |
 
 Configure sources in YAML: `discovery.sources`, `market_data.sources`, `quotes.source`.
@@ -249,8 +346,12 @@ solana-sniper run --dry-run                 # live Solana data, simulated confir
 solana-sniper run                           # live SIGNAL mode: confirm with b N / s N in the TUI
 solana-sniper run --dry-run -c configs/synthetic.yaml   # offline end-to-end run (no network)
 solana-sniper run --no-dashboard --duration 300         # plain log output, stop after 5 minutes
+solana-sniper wallet create|import|show     # dedicated hot wallet for autonomous mode (the key is never printed)
+solana-sniper arm --max-loss-sol 0.1        # enable autonomous trading with hard caps (writes sniper.env + state/armed.json)
+solana-sniper run --autonomous              # AUTONOMOUS: signs and broadcasts swaps from the hot wallet, fills verified on-chain
+solana-sniper kill | disarm | resume        # stop buys+sells / stop new buys only / lift the kill switch
 
-solana-sniper status                        # portfolio snapshot + db counts (from another terminal)
+solana-sniper status                        # portfolio snapshot + db counts + arming state (from another terminal)
 solana-sniper positions [--all]
 solana-sniper candidates
 solana-sniper portfolio                     # ledger view
@@ -268,7 +369,8 @@ solana-sniper doctor                        # config, db, network, providers, cr
 
 Dashboard keys (type and press Enter): `b 1` confirm BUY #1 · `r 1` reject · `s 2` confirm SELL #2 ·
 `i 2` ignore · `b 1 0.12 950000 <sig>` confirm and record the actual SOL spent / tokens received ·
-`p` positions · `c` candidates · `q` quit.
+`p` positions · `c` candidates · `kill` / `disarm [reason]` / `resume` / `a` (autonomous mode) ·
+`q` quit.
 
 ## 8. Bankroll scaling
 
@@ -333,10 +435,11 @@ Exit signals have a TTL and a cooldown; an ignored exit returns the position to 
 
 SQLite (WAL) tables: sessions, tokens, observations, trades, features, check_results, scores,
 signals, decisions, quotes, positions, fills, ledger, account_state, portfolio_snapshots,
-milestones, execution_records, state_transitions, errors, outcomes. On startup the account is rebuilt from
-`account_state` (or from the ledger if missing), open positions are re-registered, subscribed to
-market data and monitored again. `replay SESSION_ID` feeds the recorded stream into a fresh
-engine on a manual clock and writes to `<db>-replay.db`.
+milestones, execution_records, execution_intents (autonomous sends), state_transitions, errors,
+outcomes. On startup the account is rebuilt from `account_state` (or from the ledger if missing),
+open positions are re-registered, subscribed to market data and monitored again; in autonomous
+mode in-flight intents are reconciled by signature first. `replay SESSION_ID` feeds the recorded
+stream into a fresh engine on a manual clock and writes to `<db>-replay.db`.
 
 ## MACOS PLUG-AND-PLAY SETUP
 
@@ -369,20 +472,24 @@ home) and adds `~/.local/bin` to PATH in `~/.zprofile`/`~/.bash_profile` once (`
 ~/Library/Application Support/SolanaSniper/
   db/         sniper.db (SQLite, WAL)            — portfolio, positions, ledger, observations
   logs/       sniper.log (rotating), service.out.log, service.err.log
-  state/      status.json (heartbeat, every 5 s), commands (headless confirmations)
-  sniper.env  local secrets/config (mode 600): API keys, SNIPER_SERVICE_MODE, overrides
+  state/      status.json (heartbeat, every 5 s), commands (headless confirmations),
+              armed.json / disarmed.json / KILL (autonomous arming markers)
+  wallet/     hot-wallet.json (autonomous mode only; directory 700, file 600, never committed)
+  sniper.env  local secrets/config (mode 600): API keys, SNIPER_SERVICE_MODE, the key-file PATH, caps
 ```
 
-`SNIPER_HOME` points there for the service and every script; `data/`, `.env` and `sniper.env`
-are git-ignored. Put API keys (Helius, Jupiter, Discord/Telegram, wallet **public** key) in
-`sniper.env`; the format is the same as `.env.example`.
+`SNIPER_HOME` points there for the service and every script; `data/`, `.env`, `sniper.env` and
+`wallet/` are git-ignored. Put API keys (Helius, Jupiter, Discord/Telegram, wallet **public** key)
+in `sniper.env`; the format is the same as `.env.example`.
 
 **Deployment mode.** The service runs `solana-sniper run --dry-run --no-dashboard --quiet` by
 default: live Solana data, real signals, simulated confirmations. Set `SNIPER_SERVICE_MODE=signal`
 in `sniper.env` (or `./install-macos.sh --mode signal`) for live signal mode, where *you* confirm
 each BUY/SELL: `./cmd.sh b 1`, `./cmd.sh s 2`, `./cmd.sh r 1`, `./cmd.sh i 2`, or
 `./cmd.sh b 1 0.12 950000 <txsig>` to record the actual fill you executed in your own wallet.
-There is no mode that signs or broadcasts transactions.
+`SNIPER_SERVICE_MODE=autonomous` (or `--mode autonomous`) runs `run --autonomous`: the service
+then signs and broadcasts from the hot wallet, but only starts once `wallet create` and `arm`
+have been run; `./cmd.sh kill` stops it from any terminal.
 
 **Commands**
 
@@ -393,9 +500,9 @@ There is no mode that signs or broadcasts transactions.
 | `./restart.sh` | stop + start; open positions are restored from the database and monitoring resumes |
 | `./status.sh` | launchd state + PID, uptime, connection status per provider, market-data freshness, database health, tokens monitored, open positions, last signal, last error |
 | `./logs.sh [-n N] [app\|out\|err\|all]` | follow the rotating app log and launchd stdout/stderr |
-| `./cmd.sh <command>` | queue a confirmation for the headless service (`b N`, `s N`, `r N`, `i N`, `p`, `c`) |
+| `./cmd.sh <command>` | queue a command for the headless service (`b N`, `s N`, `r N`, `i N`, `p`, `c`; autonomous: `kill`, `disarm [reason]`, `resume`, `a`) |
 | `./update.sh` | fast-forward pull, reinstall deps, `config-check`, `migrate`, run tests; restarts the service **only** if every step passes |
-| `./doctor.sh` | verifies python, venv, directories, env file permissions, repository safety (secrets and runtime data git-ignored and untracked, checked with paths relative to the checkout so it is right on a fresh clone with no `data/`), plist validity, launchd state, heartbeat, then runs `solana-sniper doctor` |
+| `./doctor.sh` | verifies python, venv, directories, env file and wallet directory permissions, repository safety (secrets and runtime data git-ignored and untracked, checked with paths relative to the checkout so it is right on a fresh clone with no `data/`), plist validity and service mode, launchd state, heartbeat, then runs `solana-sniper doctor` (which also checks the hot wallet file, arming readiness and the wallet balance) |
 
 **launchd behaviour.** `RunAtLoad` starts the agent at login; `KeepAlive.SuccessfulExit=false`
 restarts it after a crash (non-zero exit) with a 10 s throttle but leaves it stopped after
@@ -510,14 +617,17 @@ viewer, nothing else:
   your phone, use Tailscale or an SSH port forward to the Mac; the dashboard does no networking
   of its own.
 * **Sessions.** PAPER sessions are the databases under `<home>/db/paper/`, LIVE / DRY_RUN /
-  REPLAY sessions are the rows of the `sessions` table in `<home>/db/*.db`. The sidebar groups
-  them by mode, newest first; the running session (fresh heartbeat naming it) is selected by
-  default, `--paper` / `--session` override that.
+  AUTONOMOUS / REPLAY sessions are the rows of the `sessions` table in `<home>/db/*.db`. The
+  sidebar groups them by mode, newest first; the running session (fresh heartbeat naming it) is
+  selected by default, `--paper` / `--session` override that.
 * **Provenance header on every page.** A live-data paper run shows
   `PAPER · MARKET DATA: LIVE · EXECUTION: SIMULATED · REAL TRANSACTIONS: DISABLED`; a synthetic
   run shows `PAPER / TEST · MARKET DATA: SYNTHETIC`; a live signal session shows
   `LIVE / SIGNAL MODE · EXECUTION: MANUAL SIGNAL / ESTIMATED / USER-REPORTED ·
-  REAL TRANSACTIONS: NOT RECONCILED ON-CHAIN`. Market-data provenance is read from the session's
+  REAL TRANSACTIONS: NOT RECONCILED ON-CHAIN`; an autonomous session shows a red
+  `LIVE / AUTONOMOUS · EXECUTION: BOT-SIGNED, RECONCILED ON-CHAIN · REAL TRANSACTIONS:
+  ENABLED (hot wallet)` banner, and the sidebar badge becomes `HOT WALLET ACTIVE` (the engine
+  signs; the page still cannot). Market-data provenance is read from the session's
   recorded outcomes, tokens and observations (the heartbeat only when nothing is recorded yet);
   a live-data paper run is never labelled synthetic. Whether the engine is alive comes from the
   heartbeat (`RUNNING` with the engine state, `ENDED`, or `NOT RUNNING` with the last write or
@@ -527,17 +637,19 @@ viewer, nothing else:
   first), Equity (equity / cash / open value curve, drawdown, realized-unrealized-exposure; long
   histories are downsampled inside SQLite and the maximum drawdown is computed from the full
   history), Positions (open and closed, executable vs estimated value, provenance, units,
-  staleness, "verified on-chain: no"), Candidates (state, score, age, liquidity, 5-minute volume,
+  staleness, "verified on-chain: yes" only for autonomous fills), Candidates (state, score, age, liquidity, 5-minute volume,
   velocity, momentum, acceleration, data age, check verdict, gate reason; active states
   highlighted), Entry attempts (decision badges BUY_SIGNAL / ABANDONED / EXPIRED / HARD_REJECT /
   QUOTE_FAILED / SIZING_ZERO / STALE / CANCELLED / PENDING and the full forensic record of each
   latch window, filterable by decision), Signals (display only), Fills (simulated vs estimated /
-  user-reported, never verified), Token inspector (search by mint or symbol: metadata,
+  user-reported vs verified on-chain with the confirmed signature), Token inspector (search by mint or symbol: metadata,
   transition timeline, score history chart, features, checks, quotes, attempts, signals, fills,
   outcomes, price/liquidity chart), Outcomes (the same buckets, Wilson intervals and warnings as
   `solana-sniper evaluate`, with the same "no claim of profitability" wording), Providers
   (governor health from the heartbeat), Engine (heartbeat, ticks, uptime, counters, storage
-  queue/dropped/failed, persisted write-integrity with the DATA INTEGRITY COMPROMISED banner),
+  queue/dropped/failed, persisted write-integrity with the DATA INTEGRITY COMPROMISED banner,
+  and for an autonomous session the arming state, wallet address and balance, spend today,
+  loss vs limit, in-flight intents and send/confirm/fail counters; still no button to act),
   Events (transitions, signals, fills, milestones, errors; filters ALL / TRADING / DATA /
   PROVIDERS / ERRORS).
 * **Refresh.** Auto-refresh every 2–30 s (default 3, `--refresh-seconds`, adjustable in the
@@ -570,7 +682,8 @@ trust it with a single confirmation. That is what `OutcomeTracker` (`strategy/ou
   them unless `--include-truncated` is given.
 * Every row carries two provenances: `market_data` (`LIVE` real Solana observations, `SYNTHETIC`
   the offline world, `UNKNOWN_LEGACY` before schema version 4) and `execution` (`SIMULATED` for
-  paper/dry-run, `MANUAL_SIGNAL` for live signal mode). A paper session is `LIVE` market data
+  paper/dry-run, `MANUAL_SIGNAL` for live signal mode, `AUTONOMOUS` for the hot-wallet mode). A
+  paper session is `LIVE` market data
   with `SIMULATED` execution and is never described as synthetic; its multiples are still
   passive price paths, not executable returns.
 * `evaluate` prints, per group (all followed, rejected, never qualified, qualified, signalled,
@@ -663,8 +776,20 @@ mypy              # --strict via pyproject
   low-latency discovery paths. A Solana `logsSubscribe` adapter (Raydium/PumpSwap pool creation)
   is the natural next addition behind `TokenDiscoveryProvider`.
 * Fills in live signal mode are booked at quoted amounts (`ESTIMATED`) unless the user reports
-  actual amounts (`b 1 <sol> <tokens_ui> <sig>`, recorded as `USER_REPORTED`); there is no
-  on-chain fill reconciliation, so no record is ever `VERIFIED_ONCHAIN`.
+  actual amounts (`b 1 <sol> <tokens_ui> <sig>`, recorded as `USER_REPORTED`); only autonomous
+  mode reconciles fills on-chain, so only its records are `VERIFIED_ONCHAIN`.
+* Autonomous mode was proven offline (mocked providers, a fake node executing the signed
+  transactions) and never against Solana mainnet from the build environment. Real swaps can fail
+  in ways the fake cannot: Jupiter routes that stop existing between quote and build, priority
+  fees that are too low for the moment, RPC nodes that drop or delay a transaction, and slippage
+  beyond the cap that the on-chain program enforces by failing the swap. Every such case leaves a
+  `FAILED` / `EXPIRED` / `ABANDONED` intent and a cooldown, never a phantom position, but the
+  first real-money session should be watched. The loss limit bounds the SOL that can leave the
+  wallet through buys; it cannot bound how far an open position falls before the exit sells, and
+  a wallet that cannot sell (KILL, RPC outage, dead pool) keeps its exposure.
+* The hot wallet is a file on the machine that runs the bot: its security is the machine's. The
+  software never copies it anywhere, but it also cannot protect it from someone with access to
+  your user account.
 * Databases written before schema version 2 are migrated on first start: legacy fills, positions
   and ledger rows are labelled `UNKNOWN_LEGACY` and legacy fill token amounts are kept under
   `legacy_token_amount` because their unit was ambiguous (buys were UI, sells were raw). A legacy

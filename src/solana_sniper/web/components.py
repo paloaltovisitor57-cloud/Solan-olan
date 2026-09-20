@@ -80,11 +80,13 @@ html, body, [data-testid="stAppViewContainer"] { background: #0b0f14; }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; }
 .sniper-banner.test { border-left-color: #e0b04f; }
 .sniper-banner.live { border-left-color: #e06c6c; }
+.sniper-banner.autonomous { border-left-color: #ff3b3b; border-color: #5a1f1f; }
 .sniper-banner.unknown { border-left-color: #7d8794; }
 .sniper-banner .row { display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center; }
 .sniper-banner .k { color: var(--muted); }
 .sniper-banner .v { color: var(--ink); font-weight: 600; }
 .sniper-banner .disabled { color: #e06c6c; font-weight: 700; }
+.sniper-banner .enabled { color: #ff3b3b; font-weight: 700; }
 .sniper-title { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.95rem;
   letter-spacing: .06em; color: var(--muted); text-transform: uppercase; margin: 0 0 4px 0; }
 .sniper-kv { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem;
@@ -207,6 +209,7 @@ def provenance_header(
 ) -> None:
     """The banner every page starts with: mode, market data, execution, real transactions."""
     tone = prov.tone
+    real_class = "enabled" if tone == "autonomous" else "disabled"
     rows = [
         f'<span class="v">{prov.mode_label}</span>'
         f'<span class="k">session</span> <span class="v">{session_id}</span>'
@@ -220,12 +223,18 @@ def provenance_header(
         f'<span class="k">MARKET DATA:</span> <span class="v">{prov.market_data}</span>'
         f'<span class="k">EXECUTION:</span> <span class="v">{prov.execution}</span>'
         f'<span class="k">REAL TRANSACTIONS:</span> '
-        f'<span class="disabled">{prov.real_transactions}</span>',
+        f'<span class="{real_class}">{prov.real_transactions}</span>',
     ]
     html = f'<div class="sniper-banner {tone}">' + "".join(
         f'<div class="row">{r}</div>' for r in rows
     )
-    if not prov.simulated:
+    if tone == "autonomous":
+        html += (
+            '<div class="row"><span class="k">This session signs and broadcasts real swaps from '
+            "its dedicated hot wallet. Every fill marked verified was read back from the confirmed "
+            "transaction; open values are quote estimates. This page only reads.</span></div>"
+        )
+    elif not prov.simulated:
         html += (
             '<div class="row"><span class="k">Fills are what a human confirmed at quoted or '
             "user-typed amounts; nothing here was signed, broadcast or reconciled on-chain by "

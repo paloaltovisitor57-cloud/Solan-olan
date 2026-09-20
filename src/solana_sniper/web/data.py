@@ -36,6 +36,7 @@ from solana_sniper.web.models import (
     ALIVE_ENDED,
     ALIVE_NOT_RUNNING,
     ALIVE_RUNNING,
+    AutonomyHealth,
     CandidateView,
     ConnectionHealth,
     EngineHealth,
@@ -302,6 +303,7 @@ def _position_view(p: Position, now: datetime) -> PositionView:
         held_s=p.holding_seconds(now),
         last_valued_at=p.last_valued_at,
         last_quote_at=p.last_quote_at,
+        verified_onchain=p.is_verified,
     )
 
 
@@ -367,6 +369,8 @@ def _fill_view(row: sqlite3.Row, symbols: dict[str, str | None]) -> FillView:
             reported_tx_signature=_str(payload.get("reported_tx_signature")),
             note="record could not be decoded with the current Fill model",
             readable=False,
+            verified_onchain=bool(payload.get("verified_onchain")),
+            tx_signature=_str(payload.get("tx_signature")),
         )
     return FillView(
         **base,  # type: ignore[arg-type]
@@ -380,6 +384,8 @@ def _fill_view(row: sqlite3.Row, symbols: dict[str, str | None]) -> FillView:
         units=str(fill.units),
         reported_tx_signature=fill.reported_tx_signature,
         note=scrub_text(fill.note),
+        verified_onchain=fill.verified_onchain,
+        tx_signature=fill.tx_signature,
     )
 
 
@@ -1115,6 +1121,7 @@ class DashboardRepository:
             records_verified_onchain=bool(s.get("records_verified_onchain", False)),
             integrity=integrity,
             stop_reason=_text(s.get("stop_reason")) if s.get("stopped") else None,
+            autonomy=_autonomy_health(s.get("autonomy")),
         )
 
     # --------------------------------------------------------------- events
@@ -1444,6 +1451,32 @@ class DashboardRepository:
             min_observations=min_observations,
             rows=recent,
         )
+
+
+def _autonomy_health(raw: object) -> AutonomyHealth | None:
+    """The heartbeat's autonomy block, scrubbed like every other free text."""
+    if not isinstance(raw, dict):
+        return None
+    caps_raw = raw.get("caps")
+    return AutonomyHealth(
+        armed=bool(raw.get("armed")),
+        state=_text(raw.get("state")) or "unknown",
+        kill_switch=bool(raw.get("kill_switch")),
+        disarmed_reason=_text(raw.get("disarmed_reason")) if raw.get("disarmed_reason") else None,
+        wallet_public_key=_str(raw.get("wallet_public_key")),
+        wallet_sol=_str(raw.get("wallet_sol")),
+        wallet_checked_at=_parse_dt(raw.get("wallet_checked_at")),
+        spent_today_sol=_str(raw.get("spent_today_sol")),
+        loss_sol=_str(raw.get("loss_sol")),
+        max_total_loss_sol=_str(raw.get("max_total_loss_sol")),
+        caps={str(k): v for k, v in caps_raw.items()} if isinstance(caps_raw, dict) else {},
+        intents_in_flight=_int(raw.get("intents_in_flight")) or 0,
+        sends=_int(raw.get("sends")) or 0,
+        confirmed=_int(raw.get("confirmed")) or 0,
+        failed=_int(raw.get("failed")) or 0,
+        last_send_at=_parse_dt(raw.get("last_send_at")),
+        last_confirmed_at=_parse_dt(raw.get("last_confirmed_at")),
+    )
 
 
 def _engine_health_empty(

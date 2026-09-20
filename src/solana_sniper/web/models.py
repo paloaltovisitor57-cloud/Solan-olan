@@ -65,15 +65,16 @@ class Heartbeat:
 
 @dataclass(frozen=True, slots=True)
 class Provenance:
-    """What the numbers on screen are: which market data, which execution, and the fact that
-    nothing was ever signed or broadcast."""
+    """What the numbers on screen are: which market data, which execution, and whether real
+    transactions were involved (only an AUTONOMOUS session ever signed and broadcast; this page
+    itself never does)."""
 
-    mode_label: str  # PAPER | PAPER / TEST | LIVE / SIGNAL MODE | DRY RUN | REPLAY
+    mode_label: str  # PAPER | PAPER / TEST | LIVE / SIGNAL MODE | LIVE / AUTONOMOUS | DRY RUN ...
     market_data: str  # LIVE | SYNTHETIC | MIXED | NOT YET OBSERVED | RECORDED
-    execution: str  # SIMULATED | MANUAL SIGNAL / ESTIMATED / USER-REPORTED
-    real_transactions: str  # DISABLED | NOT RECONCILED ON-CHAIN
+    execution: str  # SIMULATED | MANUAL SIGNAL / ... | BOT-SIGNED, RECONCILED ON-CHAIN
+    real_transactions: str  # DISABLED | NOT RECONCILED ON-CHAIN | ENABLED (hot wallet)
     simulated: bool
-    tone: Literal["paper", "test", "live", "unknown"]
+    tone: Literal["paper", "test", "live", "autonomous", "unknown"]
 
     def lines(self) -> tuple[str, ...]:
         return (
@@ -127,11 +128,20 @@ def provenance_for(mode: str, market_data: str) -> Provenance:
             simulated=False,
             tone="live",
         )
+    if mode_u == "AUTONOMOUS":
+        return Provenance(
+            mode_label="LIVE / AUTONOMOUS",
+            market_data=market_data,
+            execution="BOT-SIGNED, RECONCILED ON-CHAIN",
+            real_transactions="ENABLED (hot wallet)",
+            simulated=False,
+            tone="autonomous",
+        )
     return Provenance(
         mode_label=f"UNKNOWN MODE ({mode_u})",
         market_data=market_data,
         execution="UNKNOWN",
-        real_transactions="NEVER BROADCAST BY THIS SOFTWARE",
+        real_transactions="UNKNOWN (only an AUTONOMOUS session ever broadcasts)",
         simulated=False,
         tone="unknown",
     )
@@ -319,6 +329,7 @@ class FillView:
     note: str
     readable: bool = True
     verified_onchain: bool = False
+    tx_signature: str | None = None  # the confirmed signature (autonomous fills only)
 
 
 @dataclass(frozen=True, slots=True)
@@ -347,6 +358,29 @@ class ConnectionHealth:
     kind: str
     connected: bool
     last_activity_age_s: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class AutonomyHealth:
+    """The heartbeat's `autonomy` block of an AUTONOMOUS session (all public values)."""
+
+    armed: bool
+    state: str
+    kill_switch: bool
+    disarmed_reason: str | None
+    wallet_public_key: str | None
+    wallet_sol: str | None
+    wallet_checked_at: datetime | None
+    spent_today_sol: str | None
+    loss_sol: str | None
+    max_total_loss_sol: str | None
+    caps: dict[str, Any]
+    intents_in_flight: int
+    sends: int
+    confirmed: int
+    failed: int
+    last_send_at: datetime | None
+    last_confirmed_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,6 +426,7 @@ class EngineHealth:
     records_verified_onchain: bool
     integrity: Integrity | None  # persisted counters (survive a crash)
     stop_reason: str | None
+    autonomy: AutonomyHealth | None = None
 
 
 EventCategory = Literal["ALL", "TRADING", "DATA", "PROVIDERS", "ERRORS"]

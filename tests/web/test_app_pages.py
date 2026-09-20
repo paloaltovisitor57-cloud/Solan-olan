@@ -91,6 +91,86 @@ def test_live_session_shows_signal_mode_header(
     assert set(frame["verified on-chain"]) == {"no"}
 
 
+def test_autonomous_session_shows_hot_wallet_header_and_verified_fills(
+    isolated_runtime_home: Path, web_env: Callable[..., None]
+) -> None:
+    from solana_sniper.domain.enums import FillProvenance
+    from tests.web.seed import seed_live
+
+    home = isolated_runtime_home
+    sid = "autonomous-20260918-090000-cccccc"
+    wallet = "HotWa11etPubKey1111111111111111111111111111"
+    asyncio.run(
+        seed_live(
+            home,
+            sid,
+            mode="AUTONOMOUS",
+            fill_provenance=FillProvenance.VERIFIED_ONCHAIN,
+            end=False,
+            db_name="sniper-auto.db",
+        )
+    )
+    write_heartbeat(
+        home,
+        sid,
+        extra={
+            "mode": "AUTONOMOUS",
+            "execution_provenance": "AUTONOMOUS",
+            "records_verified_onchain": True,
+            "autonomy": {
+                "armed": True,
+                "state": "armed (loss limit 0.25 SOL)",
+                "kill_switch": False,
+                "disarmed_reason": None,
+                "armed_at": "2026-09-18T08:59:00+00:00",
+                "wallet_public_key": wallet,
+                "wallet_sol": "0.912345",
+                "wallet_checked_at": "2026-09-18T09:10:00+00:00",
+                "spent_today_sol": "0.050000",
+                "loss_sol": "0.004000",
+                "max_total_loss_sol": "0.25",
+                "caps": {
+                    "max_trade_sol": "0.05",
+                    "max_daily_spend_sol": "0.5",
+                    "max_open_positions": 2,
+                    "reserve_sol": "0.02",
+                },
+                "intents_in_flight": 0,
+                "sends": 2,
+                "confirmed": 2,
+                "failed": 0,
+                "last_send_at": "2026-09-18T09:05:00+00:00",
+                "last_confirmed_at": "2026-09-18T09:05:03+00:00",
+            },
+        },
+    )
+    web_env(home, session=sid)
+    at = run_app()
+    assert not at.exception
+    text = all_text(at)
+    assert "LIVE / AUTONOMOUS" in text and "BOT-SIGNED, RECONCILED ON-CHAIN" in text
+    assert "ENABLED (hot wallet)" in text and "signs and broadcasts real swaps" in text
+    assert "HOT WALLET ACTIVE" in text and "READ-ONLY PAGE" in text
+    assert "NO SIGNING" not in text  # that badge would be a lie next to this session
+    assert at.sidebar.radio[0].value == "LIVE"  # autonomous sessions are LIVE-kind
+    goto(at, "Fills")
+    assert not at.exception
+    frame = at.dataframe[0].value
+    assert set(frame["provenance"]) == {"VERIFIED_ONCHAIN"}
+    assert set(frame["kind"]) == {"verified on-chain"}
+    assert set(frame["verified on-chain"]) == {"yes"}
+    assert all(str(s).startswith("5VerifiedOnChain") for s in frame["signature"])
+    assert "VERIFIED ON-CHAIN" in all_text(at) and "2 (only an autonomous session" in all_text(at)
+    goto(at, "Positions")
+    assert "VERIFIED ON-CHAIN: YES" in all_text(at)
+    goto(at, "Engine")
+    text = all_text(at)
+    assert "yes (autonomous fills read back from the chain)" in text
+    assert "ARMED" in text and wallet in text and "0.912345 SOL" in text
+    assert "0.004000 / 0.25 SOL" in text and "2 / 2 / 0" in text
+    assert "per trade ≤ 0.05 SOL" in text and "solana-sniper kill" in text
+
+
 def test_session_selector_is_organised_by_mode_and_switches_databases(
     seeded_home: SeededHome, web_env: Callable[..., None]
 ) -> None:
@@ -159,7 +239,8 @@ def test_positions_page_distinguishes_executable_and_estimated_value(
         "TRAILING_PEAK"
     ]
     text = all_text(at)
-    assert "VERIFIED ON-CHAIN: NO" in text and "No position is verified on-chain" in text
+    assert "VERIFIED ON-CHAIN: NO" in text and "VERIFIED ON-CHAIN: YES" not in text
+    assert "Only those last positions are verified on-chain" in text
     assert len(at.expander) == 2
 
 
@@ -282,7 +363,8 @@ def test_provider_health_and_engine_pages(
     goto(at, "Engine")
     assert not at.exception
     text = all_text(at)
-    assert "HEALTHY" in text and "FRESH" in text and "never (no reconciliation exists)" in text
+    assert "HEALTHY" in text and "FRESH" in text
+    assert "no (this session has no reconciled fills)" in text and "HOT WALLET" not in text
     labels = {m.label for m in at.metric}
     assert {"Uptime", "Last tick", "Storage queued", "Storage dropped", "Watched tokens"} <= labels
     assert "pumpportal" in text and "connected" in text

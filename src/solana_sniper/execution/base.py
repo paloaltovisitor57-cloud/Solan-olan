@@ -1,6 +1,8 @@
 """Execution interface.
 
-The engine never signs or broadcasts. An ExecutionInterface turns a signal into a *pending order*
+The engine itself never signs or broadcasts; only the autonomous adapter (`execution/autonomous.py`,
+through the wallet package) does, and only in autonomous mode. An ExecutionInterface turns a
+signal into a *pending order*
 that a human confirms (or a dry-run auto-confirms). Confirming yields a Fill that the portfolio
 records. A future adapter (e.g. wallet-connected) implements this same interface.
 """

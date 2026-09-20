@@ -208,6 +208,7 @@ def _fill(
     mint: str, side: SignalKind, at: datetime, *, provenance: FillProvenance, signal_id: str
 ) -> Fill:
     qty = Decimal("1000000")
+    verified = provenance is FillProvenance.VERIFIED_ONCHAIN
     return Fill(
         fill_id=f"fill-{side}-{signal_id}",
         signal_id=signal_id,
@@ -227,6 +228,8 @@ def _fill(
         reported_tx_signature="sig-user-typed"
         if provenance is FillProvenance.USER_REPORTED
         else None,
+        verified_onchain=verified,
+        tx_signature=f"5VerifiedOnChain{side}{signal_id[-6:]}" if verified else None,
     )
 
 
@@ -343,11 +346,16 @@ async def seed_session(
     error_secret: str | None = None,
 ) -> None:
     """Write a complete, self-consistent session with the engine's writer."""
-    execution = (
-        ExecutionProvenance.SIMULATED
-        if fill_provenance is FillProvenance.SIMULATED
-        else ExecutionProvenance.MANUAL_SIGNAL
-    )
+    if fill_provenance is FillProvenance.SIMULATED:
+        execution = ExecutionProvenance.SIMULATED
+    elif fill_provenance is FillProvenance.VERIFIED_ONCHAIN:
+        execution = ExecutionProvenance.AUTONOMOUS
+    else:
+        execution = ExecutionProvenance.MANUAL_SIGNAL
+    decided_by = {
+        ExecutionProvenance.SIMULATED: "DRY_RUN",
+        ExecutionProvenance.AUTONOMOUS: "AUTONOMOUS",
+    }.get(execution, "HUMAN")
     source = "synthetic" if market is MarketDataProvenance.SYNTHETIC else "dexscreener"
     venue = Venue.SYNTHETIC if market is MarketDataProvenance.SYNTHETIC else Venue.RAYDIUM
     repo = Repository(db_url, session_id=session_id)
@@ -469,7 +477,7 @@ async def seed_session(
                     session_id=session_id,
                     signal_id="sig-buy-ANALOS",
                     kind="CONFIRM",
-                    source="DRY_RUN" if execution is ExecutionProvenance.SIMULATED else "HUMAN",
+                    source=decided_by,
                     decided_at=t + timedelta(seconds=37),
                     note="",
                 )

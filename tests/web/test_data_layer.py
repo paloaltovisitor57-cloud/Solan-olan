@@ -93,14 +93,16 @@ def test_dashboard_never_writes_to_the_database(seeded_home: SeededHome) -> None
 
 
 async def _old_schema_db(path: Path) -> None:
-    """A database the engine would migrate: schema version 3 without the v4 outcome columns."""
+    """A database the engine would migrate: schema version 3 without the v4 outcome columns
+    and without the v5 execution_intents table."""
     repo = Repository(f"sqlite+aiosqlite:///{path}", session_id="old")
     await repo.init()
     await repo.close()
     with sqlite3.connect(path) as c:
-        c.execute("DELETE FROM schema_version WHERE version = 4")
+        c.execute("DELETE FROM schema_version WHERE version >= 4")
         c.execute("ALTER TABLE outcomes DROP COLUMN market_provenance")
         c.execute("ALTER TABLE outcomes DROP COLUMN execution_provenance")
+        c.execute("DROP TABLE IF EXISTS execution_intents")
         c.commit()
 
 

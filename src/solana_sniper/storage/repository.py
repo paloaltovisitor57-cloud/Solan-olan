@@ -32,6 +32,7 @@ from solana_sniper.domain.models import (
     EntryAttempt,
     EntryScore,
     ErrorRecord,
+    ExecutionIntent,
     ExecutionRecord,
     FeatureVector,
     Fill,
@@ -53,6 +54,7 @@ from solana_sniper.storage.models import (
     DecisionRow,
     EntryAttemptRow,
     ErrorRow,
+    ExecutionIntentRow,
     ExecutionRecordRow,
     FeatureRow,
     FillRow,
@@ -86,7 +88,9 @@ WriteOp = Callable[[AsyncSession], Awaitable[None]]
 # IMPORTANT rows go through the background writer but are never dropped; TELEMETRY rows are
 # research data that may be dropped only when the writer falls hopelessly behind, and every drop
 # is counted per kind, logged, and degrades health.
-CRITICAL_KINDS = frozenset({"fill", "position", "ledger", "account_state", "outcome", "session"})
+CRITICAL_KINDS = frozenset(
+    {"fill", "position", "ledger", "account_state", "outcome", "session", "execution_intent"}
+)
 IMPORTANT_KINDS = frozenset(
     {"token", "token_state", "signal", "decision", "execution_record", "milestone", "entry_attempt"}
 )
@@ -956,6 +960,64 @@ class Repository:
             )
         return [dataclass_from_dict(EntryAttempt, r.payload) for r in rows]
 
+    # ------------------------------------------------------ execution intents
+    def _intent_op(self, i: ExecutionIntent) -> WriteOp:
+        payload = to_jsonable(i)
+
+        async def op(s: AsyncSession) -> None:
+            await s.merge(
+                ExecutionIntentRow(
+                    intent_id=i.intent_id,
+                    session_id=i.session_id or self.session_id,
+                    signal_id=i.signal_id,
+                    order_id=i.order_id,
+                    mint=i.mint,
+                    side=str(i.side),
+                    status=str(i.status),
+                    created_at=i.created_at,
+                    updated_at=i.updated_at,
+                    wallet_public_key=i.wallet_public_key,
+                    signature=i.signature,
+                    last_valid_block_height=i.last_valid_block_height,
+                    in_amount_raw=str(i.in_amount_raw),
+                    error=(i.error or None) and i.error[:300],
+                    fill_id=i.fill_id,
+                    payload=payload,
+                )
+            )
+
+        return op
+
+    async def save_intent_now(self, i: ExecutionIntent) -> None:
+        """CRITICAL: awaited before the next step of an autonomous swap is taken, so the
+        durable record is always at least as advanced as what was sent to the network."""
+        await self.persist_now(self._intent_op(i), "execution_intent")
+
+    async def intents(
+        self,
+        *,
+        session_id: str | None = None,
+        statuses: Sequence[str] | None = None,
+        limit: int = 500,
+    ) -> list[ExecutionIntent]:
+        async with self._sessions() as s:
+            stmt = select(ExecutionIntentRow)
+            if session_id is not None:
+                stmt = stmt.where(ExecutionIntentRow.session_id == session_id)
+            if statuses:
+                stmt = stmt.where(ExecutionIntentRow.status.in_(list(statuses)))
+            rows = (
+                (await s.execute(stmt.order_by(ExecutionIntentRow.created_at.asc()).limit(limit)))
+                .scalars()
+                .all()
+            )
+        return [dataclass_from_dict(ExecutionIntent, r.payload) for r in rows]
+
+    async def in_flight_intents(self) -> list[ExecutionIntent]:
+        """Intents that were signed (BUILT) or sent but never resolved, across sessions: the
+        wallet is shared, so a crash in an earlier session still needs reconciling."""
+        return await self.intents(statuses=("BUILT", "SENT"))
+
     def save_error(self, e: ErrorRecord) -> None:
         async def op(s: AsyncSession) -> None:
             s.add(
@@ -1292,6 +1354,7 @@ class Repository:
                 ("outcomes", OutcomeRow),
                 ("quotes", QuoteRow),
                 ("entry_attempts", EntryAttemptRow),
+                ("execution_intents", ExecutionIntentRow),
             ):
                 out[name] = len((await s.execute(select(model))).scalars().all())
         return out

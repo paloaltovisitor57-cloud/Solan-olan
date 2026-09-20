@@ -76,7 +76,7 @@ from solana_sniper.domain.models import (
 from solana_sniper.domain.money import ZERO, q_eur
 from solana_sniper.domain.state_machine import CandidateStateMachine, InvalidTransitionError
 from solana_sniper.execution.base import ExecutionInterface, FillOverride, PendingOrder, Resolution
-from solana_sniper.execution.manual import DryRunExecution, OrderNotPendingError
+from solana_sniper.execution.manual import OrderNotPendingError
 from solana_sniper.execution.preparer import TransactionPreparer
 from solana_sniper.features.engine import FeatureEngine
 from solana_sniper.filters.checks import TokenChecker
@@ -1040,8 +1040,11 @@ class Engine:
     async def _process_execution(self, now: datetime) -> None:
         resolutions: list[Resolution] = []
         resolutions.extend(await self.d.execution.expire_stale(now))
-        if isinstance(self.d.execution, DryRunExecution):
-            resolutions.extend(await self.d.execution.auto_confirm(now))
+        # adapters that resolve orders themselves (dry-run auto-confirm, autonomous on-chain
+        # execution) hand their resolutions back through the same path a human decision takes
+        auto = getattr(self.d.execution, "auto_confirm", None)
+        if auto is not None:
+            resolutions.extend(await auto(now))
         for res in resolutions:
             await self._apply_resolution(res)
 

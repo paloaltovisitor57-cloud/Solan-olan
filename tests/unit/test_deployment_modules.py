@@ -75,9 +75,9 @@ async def test_file_command_source_consumes_complete_lines(tmp_path: Path) -> No
 
 async def test_migrations_are_idempotent(tmp_path: Path) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path}/m.db"
-    assert await run_migrations(url) == [1, 2, 3, 4]
+    assert await run_migrations(url) == [1, 2, 3, 4, 5]
     assert await run_migrations(url) == []
-    assert await schema_version(url) == 4
+    assert await schema_version(url) == 5
 
 
 def test_cli_config_check_and_migrate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -101,7 +101,7 @@ def test_cli_config_check_and_migrate(tmp_path: Path, monkeypatch: pytest.Monkey
     broken.write_text("risk:\n  profile: NOPE\n")
     assert runner.invoke(app, ["config-check", "-c", str(broken)]).exit_code == 1
     res_m = runner.invoke(app, ["migrate", "-c", "configs/synthetic.yaml"])
-    assert res_m.exit_code == 0 and "schema version 4" in res_m.output, res_m.output
+    assert res_m.exit_code == 0 and "schema version 5" in res_m.output, res_m.output
     assert (tmp_path / "home" / "db" / "sniper-synthetic.db").exists()
     res_h = runner.invoke(app, ["health", "-c", "configs/synthetic.yaml"])
     assert res_h.exit_code == 2 and "no heartbeat" in res_h.output

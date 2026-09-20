@@ -31,24 +31,51 @@ from tests.integration.conftest import Harness
 from tests.unit.test_execution import make_buy_signal
 
 SRC = Path("src/solana_sniper")
+# The only places allowed to hold key material, sign or broadcast: the wallet package and the
+# autonomous executor. Everything else (engine, strategy, storage, CLI, dashboard, manual and
+# dry-run execution) must stay free of it, so that paper, dry-run and signal modes can never
+# reach a key even by accident.
+SIGNING_LAYER = ("wallet/", "execution/autonomous.py")
+FORBIDDEN = re.compile(
+    r"sendTransaction|signTransaction|sendRawTransaction|private_key|secret_key|Keypair", re.I
+)
 
 
-def test_no_broadcast_or_signing_code_paths() -> None:
-    """No module may call sendTransaction/signTransaction or handle private keys."""
-    forbidden = re.compile(
-        r"sendTransaction|signTransaction|sendRawTransaction|private_key|secret_key|Keypair", re.I
-    )
+def _allowed_to_sign(path: Path) -> bool:
+    rel = path.relative_to(SRC).as_posix()
+    return any(rel.startswith(prefix) for prefix in SIGNING_LAYER)
+
+
+def test_signing_and_broadcast_code_is_confined_to_the_wallet_layer() -> None:
+    """Outside the signing layer no module may name sendTransaction/signTransaction or handle
+    key material (a comment that says never/must not is allowed, so the boundary can be
+    documented where it matters)."""
     offenders: list[str] = []
     for path in SRC.rglob("*.py"):
-        text = path.read_text()
-        for i, line in enumerate(text.splitlines(), 1):
+        if _allowed_to_sign(path):
+            continue
+        for i, line in enumerate(path.read_text().splitlines(), 1):
             if (
-                forbidden.search(line)
+                FORBIDDEN.search(line)
                 and "never" not in line.lower()
                 and "must not" not in line.lower()
             ):
                 offenders.append(f"{path}:{i}: {line.strip()}")
     assert offenders == [], offenders
+
+
+def test_signing_layer_is_exactly_where_declared() -> None:
+    """The reverse direction: the modules that do sign are the ones the README and the
+    dashboard boundary name; key handling has not moved elsewhere under another name."""
+    signing_modules = sorted(
+        p.relative_to(SRC).as_posix()
+        for p in SRC.rglob("*.py")
+        if _allowed_to_sign(p) and FORBIDDEN.search(p.read_text())
+    )
+    assert signing_modules, "the wallet layer must exist and be the one that signs"
+    assert all(m.startswith(SIGNING_LAYER) for m in signing_modules)
+    web = SRC / "web"
+    assert not any(FORBIDDEN.search(p.read_text()) for p in web.rglob("*.py"))
 
 
 def test_execution_interface_has_no_broadcast_method() -> None:

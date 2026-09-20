@@ -200,7 +200,7 @@ class IntentStatus(StrEnum):
 
     PREPARED = "PREPARED"  # rails passed, quote in progress, nothing built yet
     BUILT = "BUILT"  # transaction built and signed; signature known; not yet sent
-    SENT = "SENT"  # sendTransaction acknowledged (or possibly received); awaiting confirmation
+    SENT = "SENT"  # broadcast acknowledged (or possibly received); awaiting confirmation
     CONFIRMED = "CONFIRMED"  # confirmed on chain and reconciled into a fill
     FAILED = "FAILED"  # rejected by preflight/the network, or the transaction errored on chain
     EXPIRED = "EXPIRED"  # blockhash expired before confirmation; the transaction cannot land

@@ -1,8 +1,9 @@
 """Jupiter swap quotes (lite-api.jup.ag without a key, api.jup.ag with x-api-key).
 
 quote:  GET  /swap/v1/quote?inputMint&outputMint&amount&slippageBps
-swap:   POST /swap/v1/swap  -> base64 *unsigned* transaction for the user's own wallet.
-This module never signs and never calls sendTransaction.
+swap:   POST /swap/v1/swap  -> base64 *unsigned* transaction for a public key.
+This module does not sign and does not broadcast: signal mode hands the unsigned transaction
+to the user, autonomous mode hands it to the wallet package.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from solana_sniper.discovery.parsing import as_dict, as_float, as_int, as_list, 
 from solana_sniper.domain.clock import Clock
 from solana_sniper.domain.models import SwapQuote, new_id
 from solana_sniper.infra.http import HttpClient, HttpError, RateLimitedError
-from solana_sniper.quotes.base import QuoteError
+from solana_sniper.quotes.base import QuoteError, SwapBuild
 from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
 from solana_sniper.telemetry.redaction import safe_exception
@@ -132,10 +133,11 @@ class JupiterQuoteProvider:
             self._metrics.inc("quotes")
         return parse_quote(res.json, latency, self._clock.now())
 
-    async def prepare_unsigned_swap(self, quote: SwapQuote, user_public_key: str) -> str | None:
-        """Ask Jupiter to build the swap for the user's PUBLIC key. Returned unsigned."""
+    async def build_swap(self, quote: SwapQuote, user_public_key: str) -> SwapBuild:
+        """Ask Jupiter to build the swap for a PUBLIC key. Returned unsigned, with the block
+        height after which it can no longer land."""
         if not quote.raw:
-            return None
+            raise QuoteError("quote carries no provider payload to build a swap from")
         try:
             res = await self._http.post_json(
                 f"{self._base}/swap/v1/swap",
@@ -150,8 +152,28 @@ class JupiterQuoteProvider:
                 retries=0,
                 timeout_s=self._timeout,
             )
+        except RateLimitedError as exc:
+            raise QuoteError(f"jupiter swap build rate limited: {exc}", retryable=True) from exc
         except HttpError as exc:
+            raise QuoteError(f"jupiter swap build: {exc}", retryable=exc.retryable) from exc
+        body = as_dict(res.json) or {}
+        transaction = as_str(body.get("swapTransaction"))
+        if not transaction:
+            detail = body.get("error") or body.get("simulationError") or "no transaction returned"
+            raise QuoteError(f"jupiter swap build: {str(detail)[:160]}")
+        sim = body.get("simulationError")
+        return SwapBuild(
+            transaction_b64=transaction,
+            last_valid_block_height=as_int(body.get("lastValidBlockHeight")),
+            priority_fee_lamports=as_int(body.get("prioritizationFeeLamports")),
+            compute_unit_limit=as_int(body.get("computeUnitLimit")),
+            simulation_error=None if not sim else str(sim)[:200],
+        )
+
+    async def prepare_unsigned_swap(self, quote: SwapQuote, user_public_key: str) -> str | None:
+        """Signal mode: the unsigned swap for the user's own wallet, or None when unavailable."""
+        try:
+            return (await self.build_swap(quote, user_public_key)).transaction_b64
+        except QuoteError as exc:
             log.warning("jupiter_swap_build_failed", error=safe_exception(exc))
             return None
-        body = as_dict(res.json) or {}
-        return as_str(body.get("swapTransaction"))

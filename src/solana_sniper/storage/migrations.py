@@ -149,6 +149,12 @@ async def _v4_outcome_provenance(conn: AsyncConnection) -> None:
         )
 
 
+async def _v5_execution_intents(conn: AsyncConnection) -> None:
+    """Autonomous mode: the `execution_intents` table (durable record of every bot-signed swap).
+    A new table only; nothing existing is touched."""
+    await conn.run_sync(Base.metadata.create_all)
+
+
 MIGRATIONS: list[tuple[int, str, Step]] = [
     (1, "initial schema", _v1_initial),
     (
@@ -166,6 +172,7 @@ MIGRATIONS: list[tuple[int, str, Step]] = [
         "outcome provenance: market data (LIVE/SYNTHETIC) separate from execution (SIMULATED)",
         _v4_outcome_provenance,
     ),
+    (5, "execution intents for autonomous mode (new table only)", _v5_execution_intents),
 ]
 
 

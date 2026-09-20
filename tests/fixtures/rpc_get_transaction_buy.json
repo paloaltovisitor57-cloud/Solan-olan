@@ -1,0 +1,71 @@
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "slot": 300000123,
+    "blockTime": 1758200000,
+    "version": 0,
+    "meta": {
+      "err": null,
+      "fee": 205000,
+      "computeUnitsConsumed": 120000,
+      "preBalances": [1000000000, 2039280, 0, 1, 3000000000],
+      "postBalances": [899795000, 2039280, 2039280, 1, 3100000000],
+      "preTokenBalances": [
+        {
+          "accountIndex": 1,
+          "mint": "MintTokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "owner": "PoolAuthority111111111111111111111111111111",
+          "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "uiTokenAmount": {
+            "amount": "5000000000000",
+            "decimals": 6,
+            "uiAmount": 5000000.0,
+            "uiAmountString": "5000000"
+          }
+        }
+      ],
+      "postTokenBalances": [
+        {
+          "accountIndex": 1,
+          "mint": "MintTokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "owner": "PoolAuthority111111111111111111111111111111",
+          "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "uiTokenAmount": {
+            "amount": "4999000000000",
+            "decimals": 6,
+            "uiAmount": 4999000.0,
+            "uiAmountString": "4999000"
+          }
+        },
+        {
+          "accountIndex": 2,
+          "mint": "MintTokenAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "owner": "HotWallet1111111111111111111111111111111111",
+          "programId": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+          "uiTokenAmount": {
+            "amount": "1000000000",
+            "decimals": 6,
+            "uiAmount": 1000.0,
+            "uiAmountString": "1000"
+          }
+        }
+      ],
+      "logMessages": ["Program JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4 success"]
+    },
+    "transaction": {
+      "signatures": ["5BuySignature111111111111111111111111111111111111111111111111111111111111111111111"],
+      "message": {
+        "accountKeys": [
+          {"pubkey": "HotWallet1111111111111111111111111111111111", "signer": true, "writable": true, "source": "transaction"},
+          {"pubkey": "PoolVault11111111111111111111111111111111111", "signer": false, "writable": true, "source": "transaction"},
+          {"pubkey": "HotWalletTokenAccount11111111111111111111111", "signer": false, "writable": true, "source": "transaction"},
+          {"pubkey": "11111111111111111111111111111111", "signer": false, "writable": false, "source": "transaction"},
+          {"pubkey": "PoolSolVault1111111111111111111111111111111", "signer": false, "writable": true, "source": "lookupTable"}
+        ],
+        "instructions": [],
+        "recentBlockhash": "9Yqf2hAbcdefghijklmnopqrstuvwxyz1234567890AB"
+      }
+    }
+  }
+}

@@ -545,6 +545,59 @@ class OutcomesConfig(StrictModel):
     max_followed: int = Field(default=400, ge=1, le=5000)
 
 
+class WalletConfig(StrictModel):
+    """Where the hot wallet key FILE lives (autonomous mode only). The setting is a path; key
+    material itself is never accepted in configuration."""
+
+    key_file: str | None = None  # <home>/wallet/hot-wallet.json when created by the CLI
+
+    @field_validator("key_file")
+    @classmethod
+    def _path_not_key_material(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        candidate = v.strip()
+        if candidate == "":
+            return None
+        # a JSON byte array, a long base58 blob or a phrase is key material, not a path
+        if candidate.startswith("[") or len(candidate.split()) >= 12:
+            raise ValueError("wallet.key_file must be a file path, never the key itself")
+        if "/" not in candidate and "\\" not in candidate and len(candidate) >= 80:
+            raise ValueError("wallet.key_file must be a file path, never the key itself")
+        return candidate
+
+
+class AutonomyConfig(StrictModel):
+    """Caps for autonomous execution. Every value is enforced in code before a swap is quoted,
+    signed or sent (see wallet/rails.py). Disabled by default; `solana-sniper arm` turns it on
+    and records the loss limit."""
+
+    enabled: bool = False
+    acknowledge_real_money: bool = False  # set by `arm`: the user accepts real losses
+    max_trade_sol: Decimal = Field(default=Decimal("0.05"), gt=0, le=1000)
+    max_daily_spend_sol: Decimal = Field(default=Decimal("0.5"), gt=0, le=100000)
+    max_total_loss_sol: Decimal | None = Field(default=None, gt=0, le=100000)  # required to arm
+    max_open_positions: int = Field(default=2, ge=1, le=20)
+    reserve_sol: Decimal = Field(default=Decimal("0.02"), ge=0, le=100)  # kept for fees
+    max_slippage_bps: int = Field(default=300, ge=1, le=5000)
+    max_price_impact_pct: float = Field(default=3.0, gt=0, le=50)
+    max_priority_fee_lamports: int = Field(default=1_000_000, ge=0, le=10**9)
+    confirm_timeout_s: float = Field(default=90.0, ge=5, le=600)
+    status_poll_interval_s: float = Field(default=1.0, ge=0.2, le=30)
+    requote_max_worse_pct: float = Field(default=2.0, ge=0, le=50)
+    send_rpc_url: str | None = None  # default: providers.solana_rpc_url (shares its limits)
+    exits_continue_when_disarmed: bool = True
+
+    @field_validator("send_rpc_url")
+    @classmethod
+    def _send_url_scheme(cls, v: str | None) -> str | None:
+        if v is None or v.strip() == "":
+            return None
+        if not v.startswith(("http://", "https://")):
+            raise ValueError("autonomy.send_rpc_url must be an http(s) URL")
+        return v.strip()
+
+
 class DashboardConfig(StrictModel):
     enabled: bool = True
     refresh_hz: float = Field(default=4.0, ge=0.1, le=60)
@@ -592,6 +645,8 @@ class Settings(BaseSettings):
     dry_run: DryRunConfig = DryRunConfig()
     dashboard: DashboardConfig = DashboardConfig()
     outcomes: OutcomesConfig = OutcomesConfig()
+    wallet: WalletConfig = WalletConfig()
+    autonomy: AutonomyConfig = AutonomyConfig()
     config_path: Path | None = Field(default=None, exclude=True)
     home: Path | None = Field(default=None, exclude=True)  # SNIPER_HOME, if configured
 
@@ -619,6 +674,8 @@ class Settings(BaseSettings):
             p.jupiter_pro_base_url,
             self.storage.database_url,
         ]
+        if self.autonomy.send_rpc_url:
+            urls.append(self.autonomy.send_rpc_url)
         if a.discord_webhook_url:
             urls.append(a.discord_webhook_url.get_secret_value())
         return urls

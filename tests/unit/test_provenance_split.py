@@ -64,7 +64,7 @@ async def test_live_signal_mode_is_manual_signal_execution(tmp_path: Path) -> No
 
 async def test_migration_v4_backfills_legacy_outcome_rows(tmp_path: Path) -> None:
     url = f"sqlite+aiosqlite:///{tmp_path}/legacy.db"
-    assert await run_migrations(url) == [1, 2, 3, 4]
+    assert await run_migrations(url) == [1, 2, 3, 4, 5]
     engine = create_async_engine(url)
     legacy_payload = {
         "mint": "m",
@@ -110,7 +110,7 @@ async def test_migration_v4_backfills_legacy_outcome_rows(tmp_path: Path) -> Non
             {"p": json.dumps(legacy_payload)},
         )
     await engine.dispose()
-    assert await run_migrations(url) == [4]
+    assert await run_migrations(url) == [4, 5]
     repo = Repository(url, session_id="reader")
     await repo.init()
     (row,) = await repo.outcomes()

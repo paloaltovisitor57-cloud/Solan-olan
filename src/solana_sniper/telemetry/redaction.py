@@ -39,7 +39,7 @@ _INPUT_VALUE_RE = re.compile(r"(input_value=)(?:'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\
 # mapping keys whose *whole* value is a credential, whatever it looks like
 _SENSITIVE_KEY_RE = re.compile(
     r"(?i)^(?:.*(?:authorization|api[-_]?key|secret|token|password|passwd|pwd|cookie|"
-    r"signature|webhook|private|seed|mnemonic|credential).*)$"
+    r"signature|webhook|private|seed|mnemonic|credential|key[-_]?(?:pair|file)).*)$"
 )
 
 

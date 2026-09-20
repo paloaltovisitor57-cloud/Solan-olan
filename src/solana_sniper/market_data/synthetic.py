@@ -28,7 +28,7 @@ from solana_sniper.domain.models import (
 )
 from solana_sniper.domain.money import D, raw_to_ui, ui_to_raw
 from solana_sniper.market_data.base import EmitSnapshot, EmitTrade
-from solana_sniper.quotes.base import QuoteError
+from solana_sniper.quotes.base import QuoteError, SwapBuild
 
 WSOL = "So11111111111111111111111111111111111111112"
 TOKEN_DECIMALS = 6
@@ -397,6 +397,9 @@ class SyntheticQuoteProvider:
         return self._world.quote(
             input_mint, output_mint, amount_raw, slippage_bps, self._clock.now()
         )
+
+    async def build_swap(self, quote: SwapQuote, user_public_key: str) -> SwapBuild:
+        raise QuoteError("the synthetic world cannot build transactions")
 
     async def prepare_unsigned_swap(self, quote: SwapQuote, user_public_key: str) -> str | None:
         return None

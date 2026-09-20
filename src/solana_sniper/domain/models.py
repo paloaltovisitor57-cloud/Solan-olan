@@ -702,6 +702,7 @@ class ExecutionIntent:
     token_delta_raw: int | None = None  # confirmed: owner token delta for the mint
     fee_lamports: int | None = None
     token_decimals: int | None = None
+    exit_reason: str | None = None  # sells: the exit engine's reason, kept for recovery
 
     @property
     def in_flight(self) -> bool:

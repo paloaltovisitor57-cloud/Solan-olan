@@ -21,6 +21,12 @@ STATE_DIR = "state"
 ENV_FILE = "sniper.env"
 STATUS_FILE = "status.json"
 COMMANDS_FILE = "commands"
+# autonomous mode
+WALLET_DIR = "wallet"  # <home>/wallet/, mode 0700, holds the hot wallet key file
+WALLET_KEY_FILE = "hot-wallet.json"
+ARMED_FILE = "armed.json"  # <home>/state/: written by `arm`, removed by `disarm`
+DISARMED_FILE = "disarmed.json"  # written when a safety rail or the user disarms; `arm` clears
+KILL_FILE = "KILL"  # <home>/state/: stops buys AND sells while it exists; `resume` removes
 
 
 def platform_default_home() -> Path:
@@ -59,7 +65,15 @@ def home_source() -> str:
 def ensure_home(home: Path) -> Path:
     for sub in (DB_DIR, LOG_DIR, STATE_DIR):
         (home / sub).mkdir(parents=True, exist_ok=True)
+    wallet = home / WALLET_DIR
+    wallet.mkdir(parents=True, exist_ok=True)
+    if os.name == "posix":
+        wallet.chmod(0o700)
     return home
+
+
+def wallet_key_path(home: Path) -> Path:
+    return home / WALLET_DIR / WALLET_KEY_FILE
 
 
 def state_path(home: Path | None, name: str) -> Path:

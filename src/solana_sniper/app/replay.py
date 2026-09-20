@@ -22,7 +22,7 @@ from solana_sniper.domain.models import MarketSnapshot, SwapQuote, TokenInfo, Tr
 from solana_sniper.domain.money import raw_to_ui, ui_to_raw
 from solana_sniper.market_data.base import EmitSnapshot, EmitTrade
 from solana_sniper.market_data.tracker import TokenTracker
-from solana_sniper.quotes.base import QuoteError
+from solana_sniper.quotes.base import QuoteError, SwapBuild
 from solana_sniper.storage.repository import Repository
 from solana_sniper.storage.serialization import dataclass_from_dict
 
@@ -134,6 +134,9 @@ class ReplayQuoteProvider:
             quoted_at=now,
             latency_ms=0.0,
         )
+
+    async def build_swap(self, quote: SwapQuote, user_public_key: str) -> SwapBuild:
+        raise QuoteError("replay cannot build transactions")
 
     async def prepare_unsigned_swap(self, quote: SwapQuote, user_public_key: str) -> str | None:
         return None

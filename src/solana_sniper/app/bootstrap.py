@@ -172,6 +172,12 @@ class Runtime:
         self.repo.start()
         await self.repo.start_session(str(self.mode), str(self.settings.config_path or ""))
         await self._restore_account()
+        # autonomous mode: intents that were signed or sent before a crash are reconciled by
+        # signature before the engine ticks, so a landed swap is booked instead of forgotten
+        recover = getattr(self.engine.d.execution, "recover", None)
+        if recover is not None:
+            for line in await recover():
+                log.warning("autonomous_recovery", detail=line)
         self.bus.start()
         for name, task in self.background:
             self._tasks.append(asyncio.create_task(task(), name=name))

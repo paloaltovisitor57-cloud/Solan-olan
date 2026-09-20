@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 import websockets
 
+from solana_sniper.app import arming
 from solana_sniper.app.repo_safety import check_repo_safety
+from solana_sniper.config.paths import WALLET_DIR
 from solana_sniper.config.settings import Settings
 from solana_sniper.domain.clock import SystemClock
 from solana_sniper.infra.http import HttpClient, HttpError
@@ -18,6 +22,8 @@ from solana_sniper.quotes.jupiter import JupiterQuoteProvider
 from solana_sniper.storage.repository import Repository
 from solana_sniper.telemetry.redaction import safe_exception, safe_url
 from solana_sniper.token_analysis.solana_rpc import SolanaRpcTokenProvider
+from solana_sniper.wallet.keys import WalletError, public_key_of
+from solana_sniper.wallet.rpc import SolanaSendClient
 
 USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 WSOL = "So11111111111111111111111111111111111111112"
@@ -28,6 +34,65 @@ class CheckOutcome:
     name: str
     status: str  # PASS | FAIL | SKIP | WARN
     detail: str
+
+
+def wallet_checks(settings: Settings) -> tuple[list[CheckOutcome], str | None]:
+    """`wallet` and `autonomy` checks; also returns the address for the balance check."""
+    out: list[CheckOutcome] = []
+    home = settings.home or Path("data")
+    path = arming.key_file_path(home, settings.wallet.key_file)
+    state = arming.read(home)
+    a = settings.autonomy
+    pubkey: str | None = None
+    if path is None:
+        out.append(
+            CheckOutcome(
+                "wallet",
+                "SKIP",
+                "no hot wallet (autonomous mode off); `solana-sniper wallet create` makes one",
+            )
+        )
+    else:
+        try:
+            pubkey = public_key_of(path)
+            out.append(CheckOutcome("wallet", "PASS", f"{path} -> {pubkey} (private, mode 600)"))
+        except WalletError as exc:
+            out.append(CheckOutcome("wallet", "FAIL", str(exc)))
+        wallet_dir = home / WALLET_DIR
+        if os.name == "posix" and wallet_dir.is_dir() and wallet_dir.stat().st_mode & 0o077:
+            out.append(
+                CheckOutcome(
+                    "wallet_dir",
+                    "WARN",
+                    f"{wallet_dir} is not private; fix: chmod 700 '{wallet_dir}'",
+                )
+            )
+    key_file = str(path) if path is not None else None
+    readiness = arming.readiness(
+        enabled=a.enabled, acknowledged=a.acknowledge_real_money, key_file=key_file, state=state
+    )
+    untouched = not a.enabled and not state.armed_marker and state.disarmed_reason is None
+    if path is None and untouched:
+        out.append(
+            CheckOutcome(
+                "autonomy",
+                "SKIP",
+                "disabled: signal, dry-run and paper modes never sign (wallet create + arm enable it)",
+            )
+        )
+    elif readiness:
+        out.append(CheckOutcome("autonomy", "WARN", "; ".join(readiness)))
+    else:
+        out.append(
+            CheckOutcome(
+                "autonomy",
+                "PASS",
+                f"{state.describe()}; per trade <= {a.max_trade_sol} SOL, per day <= "
+                f"{a.max_daily_spend_sol} SOL, open positions <= {a.max_open_positions}, "
+                f"reserve {a.reserve_sol} SOL, sends via {safe_url(settings.send_rpc_url())}",
+            )
+        )
+    return out, pubkey
 
 
 async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[CheckOutcome]:
@@ -78,6 +143,8 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
             f"wallet_public_key={'set' if p.wallet_public_key else 'not set (unsigned tx prep disabled)'}",
         )
     )
+    checks, hot_wallet = wallet_checks(settings)
+    out.extend(checks)
     if settings.is_synthetic:
         out.append(
             CheckOutcome("network", "SKIP", "synthetic mode: no network providers configured")
@@ -104,6 +171,33 @@ async def run_doctor(settings: Settings, *, timeout_s: float = 8.0) -> list[Chec
                     "solana_rpc", "FAIL", f"{safe_url(p.solana_rpc_url)}: {safe_exception(exc)}"
                 )
             )
+        # hot wallet balance over the send RPC (autonomous mode only)
+        if hot_wallet is not None:
+            send_url = settings.send_rpc_url()
+            try:
+                sender = SolanaSendClient(http, send_url, clock, timeout_s=timeout_s)
+                lamports = await asyncio.wait_for(sender.get_balance(hot_wallet), timeout_s)
+                sol = Decimal(lamports) / Decimal(10**9)
+                low = sol <= settings.autonomy.reserve_sol
+                out.append(
+                    CheckOutcome(
+                        "wallet_balance",
+                        "WARN" if low else "PASS",
+                        f"{sol:.4f} SOL at {safe_url(send_url)}"
+                        + (
+                            f" (not above the {settings.autonomy.reserve_sol} SOL fee reserve: "
+                            "nothing can be bought)"
+                            if low
+                            else ""
+                        ),
+                    )
+                )
+            except Exception as exc:
+                out.append(
+                    CheckOutcome(
+                        "wallet_balance", "FAIL", f"{safe_url(send_url)}: {safe_exception(exc)}"
+                    )
+                )
         # DexScreener
         try:
             res = await http.get_json(

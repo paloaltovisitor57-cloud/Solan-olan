@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Shared helpers for the macOS deployment scripts. Sourced, never executed.
-# All scripts are safe to re-run; nothing here signs or broadcasts anything.
+# All scripts are safe to re-run. The scripts never handle key material: only
+# `solana-sniper run --autonomous` signs, from the hot wallet file under $SNIPER_HOME/wallet/.
 # shellcheck disable=SC2034  # variables are consumed by the scripts that source this file
 
 set -euo pipefail
@@ -26,6 +27,7 @@ export SNIPER_CONFIG
 DB_DIR="$SNIPER_HOME/db"
 LOG_DIR="$SNIPER_HOME/logs"
 STATE_DIR="$SNIPER_HOME/state"
+WALLET_DIR="$SNIPER_HOME/wallet"
 ENV_FILE="$SNIPER_HOME/sniper.env"
 STATUS_FILE="$STATE_DIR/status.json"
 COMMANDS_FILE="$STATE_DIR/commands"
@@ -34,7 +36,9 @@ STDERR_LOG="$LOG_DIR/service.err.log"
 APP_LOG="$LOG_DIR/sniper.log"
 
 # Service mode. "dry-run" (default): live data, simulated confirmations.
-# "signal": live signal mode, human confirms with ./cmd.sh b N / s N. Nothing ever broadcasts.
+# "signal": live signal mode, human confirms with ./cmd.sh b N / s N; nothing is broadcast.
+# "autonomous": the bot signs and broadcasts real swaps from its hot wallet, within the caps
+#               recorded by `solana-sniper arm`; stop with ./cmd.sh kill or `solana-sniper kill`.
 SNIPER_SERVICE_MODE="${SNIPER_SERVICE_MODE:-dry-run}"
 
 c_red=$'\033[31m'; c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_dim=$'\033[2m'; c_reset=$'\033[0m'
@@ -63,19 +67,28 @@ load_service_mode() {
     fi
   fi
   case "$SNIPER_SERVICE_MODE" in
-    dry-run|signal) ;;
-    *) fail "SNIPER_SERVICE_MODE must be 'dry-run' or 'signal' (got '$SNIPER_SERVICE_MODE')" ;;
+    dry-run|signal|autonomous) ;;
+    *) fail "SNIPER_SERVICE_MODE must be 'dry-run', 'signal' or 'autonomous' (got '$SNIPER_SERVICE_MODE')" ;;
   esac
 }
 
 service_args() {
   # Arguments appended to `solana-sniper run` for the service.
   load_service_mode
-  if [[ "$SNIPER_SERVICE_MODE" == "dry-run" ]]; then
-    printf '%s\n' "run" "--dry-run" "--no-dashboard" "--quiet"
-  else
-    printf '%s\n' "run" "--no-dashboard" "--quiet"
-  fi
+  case "$SNIPER_SERVICE_MODE" in
+    dry-run) printf '%s\n' "run" "--dry-run" "--no-dashboard" "--quiet" ;;
+    autonomous) printf '%s\n' "run" "--autonomous" "--no-dashboard" "--quiet" ;;
+    *) printf '%s\n' "run" "--no-dashboard" "--quiet" ;;
+  esac
+}
+
+describe_service_mode() {
+  case "$SNIPER_SERVICE_MODE" in
+    dry-run) echo "dry-run (live data, simulated confirmations)" ;;
+    signal) echo "signal (live signals; a human confirms via ./cmd.sh; nothing is broadcast)" ;;
+    autonomous) echo "autonomous (REAL swaps signed from the hot wallet within the armed caps)" ;;
+    *) echo "$SNIPER_SERVICE_MODE" ;;
+  esac
 }
 
 find_python() {
@@ -123,15 +136,16 @@ pip_install() {
 }
 
 ensure_dirs() {
-  mkdir -p "$DB_DIR" "$LOG_DIR" "$STATE_DIR"
+  mkdir -p "$DB_DIR" "$LOG_DIR" "$STATE_DIR" "$WALLET_DIR"
   chmod 700 "$SNIPER_HOME" 2>/dev/null || true
+  chmod 700 "$WALLET_DIR" 2>/dev/null || true
 }
 
 ensure_env_file() {
   if [[ ! -f "$ENV_FILE" ]]; then
     {
       echo "# solana-sniper local configuration (never committed). Loaded by the service and the scripts."
-      echo "# SNIPER_SERVICE_MODE=dry-run   # dry-run (default) or signal"
+      echo "# SNIPER_SERVICE_MODE=dry-run   # dry-run (default), signal, or autonomous (after wallet create + arm)"
       echo "SNIPER_SERVICE_MODE=dry-run"
       echo
       grep -vE '^\s*$' "$REPO_DIR/.env.example" | sed 's/^\([A-Z_]*=\)$/#\1/'

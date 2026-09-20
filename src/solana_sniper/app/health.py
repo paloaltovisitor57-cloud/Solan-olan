@@ -11,6 +11,7 @@ import os
 import socket
 import tempfile
 from datetime import UTC, datetime
+from decimal import Decimal
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol
 
@@ -38,6 +39,53 @@ class ConnectionProbe(Protocol):
 
 def _age(now: datetime, when: datetime | None) -> float | None:
     return None if when is None else max(0.0, (now - when).total_seconds())
+
+
+def _sol(lamports: int | None) -> str | None:
+    return None if lamports is None else f"{Decimal(lamports) / Decimal(10**9):.6f}"
+
+
+def _iso(when: datetime | None) -> str | None:
+    return when.isoformat() if when is not None else None
+
+
+def autonomy_block(runtime: Runtime) -> tuple[dict[str, Any] | None, list[str]]:
+    """The heartbeat's `autonomy` section and its degraded notes (None outside autonomous
+    mode). Everything here is already public: the wallet address, caps and counters."""
+    auto = runtime.autonomous
+    if auto is None:
+        return None, []
+    state = auto.arming_state()
+    notes: list[str] = []
+    if state.kill:
+        notes.append("KILL switch active: no buys or sells until `solana-sniper resume`")
+    elif state.disarmed_reason is not None:
+        notes.append(f"autonomy disarmed: {state.disarmed_reason} (no new buys; exits continue)")
+    elif not state.armed_marker:
+        notes.append("autonomy not armed: no new buys")
+    block = {
+        "armed": state.armed and auto.armed_by_config,
+        "state": state.describe(),
+        "kill_switch": state.kill,
+        "disarmed_reason": state.disarmed_reason,
+        "armed_at": _iso(state.armed_at),
+        "wallet_public_key": auto.wallet_public_key,
+        "wallet_sol": _sol(auto.last_wallet_lamports),
+        "wallet_checked_at": _iso(auto.last_exposure_at),
+        "spent_today_sol": _sol(auto.spent_today_lamports()),
+        "loss_sol": _sol(auto.last_loss_lamports),
+        "max_total_loss_sol": str(state.max_total_loss_sol)
+        if state.max_total_loss_sol is not None
+        else None,
+        "caps": auto.caps(),
+        "intents_in_flight": auto.in_flight,
+        "sends": auto.sends,
+        "confirmed": auto.confirmed,
+        "failed": auto.failed,
+        "last_send_at": _iso(auto.last_send_at),
+        "last_confirmed_at": _iso(auto.last_confirmed_at),
+    }
+    return block, notes
 
 
 class HealthReporter:
@@ -104,10 +152,14 @@ class HealthReporter:
                 "data_stale": p.data_stale,
                 "provenance": str(p.provenance),
                 "units": str(p.units),
-                "verified_onchain": False,
+                "verified_onchain": p.is_verified,
             }
             for p in rt.account.open_positions
         ]
+        autonomy, autonomy_notes = autonomy_block(rt)
+        verified_any = any(p.is_verified for p in rt.account.open_positions) or bool(
+            autonomy and autonomy["confirmed"]
+        )
         last_error = stats.last_error
         # HEALTHY: everything works and the data is complete. DEGRADED: running, but something
         # is missing (dropped research rows, a rate-limited or tripped provider). UNHEALTHY: the
@@ -133,6 +185,7 @@ class HealthReporter:
                 degraded.append(f"provider {name} {str(info.get('state')).lower()}")
             elif info.get("state") == "DOWN":
                 degraded.append(f"provider {name} down")
+        degraded.extend(autonomy_notes)
         state = "UNHEALTHY" if problems else ("DEGRADED" if degraded else "HEALTHY")
         healthy = state == "HEALTHY"
         return {
@@ -153,7 +206,10 @@ class HealthReporter:
             "problems": problems,
             "degraded": degraded,
             "providers": provider_health,
-            "records_verified_onchain": False,  # this software never reconciles fills on-chain
+            # only autonomous mode reads fills back from the chain; every other mode records
+            # simulated, quote-estimated or user-reported figures
+            "records_verified_onchain": verified_any,
+            "autonomy": autonomy,
             "engine": {
                 "last_tick_age_s": last_tick_age,
                 "tick_p50_ms": tick_summary.get("p50_ms"),

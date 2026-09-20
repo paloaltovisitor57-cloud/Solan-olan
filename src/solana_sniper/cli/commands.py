@@ -1,6 +1,7 @@
 """Fast manual confirmation: `b 1` confirms BUY #1, `s 2` confirms SELL #2, etc.
 
-Reads stdin in a thread so the asyncio loop never blocks.
+Reads stdin in a thread so the asyncio loop never blocks. `kill`, `disarm` and `resume` work in
+every mode (they only write the marker files) so `./cmd.sh kill` reaches a headless service.
 """
 
 from __future__ import annotations
@@ -10,13 +11,17 @@ import sys
 import threading
 from collections.abc import Callable
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 
+from solana_sniper.app import arming
 from solana_sniper.app.engine import Engine
 from solana_sniper.execution.base import FillOverride
 
 HELP = (
     "commands: b N [sol tokens [sig]] confirm buy | r N reject buy | "
-    "s N [sol [sig]] confirm sell | i N ignore sell | p positions | c candidates | q quit | h help"
+    "s N [sol [sig]] confirm sell | i N ignore sell | p positions | c candidates | "
+    "kill stop buys+sells | disarm [reason] stop buys | resume lift KILL | a arming state | "
+    "q quit | h help"
 )
 
 
@@ -108,10 +113,25 @@ class CommandHandler:
                     )
                 if not cands:
                     self._say("no candidates")
+            elif cmd == "kill":
+                state = arming.kill(self._home())
+                self._say(f"KILL switch set: {state.describe()} (lift with `resume`)")
+            elif cmd == "disarm":
+                reason = " ".join(args) or "disarmed by operator"
+                state = arming.disarm(self._home(), reason)
+                self._say(f"{state.describe()}: no new buys, exits continue")
+            elif cmd == "resume":
+                state = arming.resume(self._home())
+                self._say(f"KILL switch removed: {state.describe()}")
+            elif cmd == "a":
+                self._say(f"autonomy: {arming.read(self._home()).describe()}")
             else:
                 self._say(f"unknown command '{cmd}'. {HELP}")
         except Exception as exc:
             self._say(f"command failed: {exc}")
+
+    def _home(self) -> Path:
+        return self._engine.settings.home or Path("data")
 
     async def run(self, reader: StdinReader) -> None:
         while True:

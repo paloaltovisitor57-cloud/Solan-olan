@@ -85,7 +85,8 @@ class Dashboard:
         e = self._engine
         snap = e.d.account.snapshot(e.now())
         m = e.d.metrics
-        mode = f"[bold red]{e.mode}[/]" if e.mode.value == "LIVE" else f"[bold green]{e.mode}[/]"
+        real = e.mode.value in ("LIVE", "AUTONOMOUS")
+        mode = f"[bold red]{e.mode}[/]" if real else f"[bold green]{e.mode}[/]"
         line1 = (
             f"BANKROLL {_eur(snap.equity_eur)}  CASH {_eur(snap.cash_eur)}  "
             f"EXPOSURE {_eur(snap.open_exposure_eur)}  EQUITY {_eur(snap.equity_eur)}  "
@@ -116,11 +117,13 @@ class Dashboard:
             f"tick p50/p95 {lat['engine_tick'].summary().get('p50_ms', '-')}/"
             f"{lat['engine_tick'].summary().get('p95_ms', '-')}"
         )
-        basis = "simulated" if e.mode.value != "LIVE" else "quote-estimated / user-reported"
-        title = (
-            f"solana-sniper {mode} session {e.session_id}  "
-            f"[dim]figures are {basis}, not on-chain verified[/]"
-        )
+        if e.mode.value == "AUTONOMOUS":
+            note = "fills read back from the chain; open values are quote estimates"
+        elif e.mode.value == "LIVE":
+            note = "figures are quote-estimated / user-reported, not on-chain verified"
+        else:
+            note = "figures are simulated, not on-chain verified"
+        title = f"solana-sniper {mode} session {e.session_id}  [dim]{note}[/]"
         return Panel(
             Group(Text(line1), Text(line2), Text(line3), Text(line4, style="dim")), title=title
         )

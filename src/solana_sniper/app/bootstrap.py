@@ -1,7 +1,9 @@
 """Composition root: builds every component from Settings and wires them together.
 
 The same builder serves live signal mode, dry-run (same live data, simulated confirmations),
-synthetic offline runs and replay. Only the execution adapter and data sources differ.
+paper, synthetic offline runs, replay and autonomous mode. Only the execution adapter and data
+sources differ. The hot wallet is loaded in exactly one branch (`RunMode.AUTONOMOUS`); every
+other mode never touches `wallet/`, whatever the configuration says.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from collections.abc import Awaitable, Callable, Coroutine
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -23,6 +26,7 @@ from websockets.asyncio.client import ClientConnection
 from solana_sniper.alerts.service import AlertService
 from solana_sniper.alerts.terminal import TerminalAlertProvider
 from solana_sniper.alerts.webhooks import DiscordAlertProvider, TelegramAlertProvider
+from solana_sniper.app import arming
 from solana_sniper.app.bootrecord import BootInfo, record_start, record_stop
 from solana_sniper.app.bus import EventBus
 from solana_sniper.app.engine import Engine, EngineDeps
@@ -38,6 +42,7 @@ from solana_sniper.discovery.service import DiscoveryService
 from solana_sniper.domain.clock import Clock, SystemClock
 from solana_sniper.domain.enums import ExecutionProvenance, MarketDataProvenance, RunMode, Urgency
 from solana_sniper.domain.models import MarketSnapshot, TokenInfo, TradeEvent
+from solana_sniper.execution.autonomous import AutonomousExecution
 from solana_sniper.execution.base import ExecutionInterface
 from solana_sniper.execution.manual import DryRunExecution, ManualExecution
 from solana_sniper.execution.preparer import TransactionPreparer
@@ -73,10 +78,27 @@ from solana_sniper.telemetry.logging import get_logger
 from solana_sniper.telemetry.metrics import Metrics
 from solana_sniper.token_analysis.base import LiquidityProvider, TokenMetadataProvider
 from solana_sniper.token_analysis.solana_rpc import SolanaRpcTokenProvider
+from solana_sniper.wallet.keys import HotWallet, WalletFileError
+from solana_sniper.wallet.keys import load as load_key_file
+from solana_sniper.wallet.rpc import SolanaSendClient
 
 log = get_logger(__name__)
 
 Task = Callable[[], Coroutine[Any, Any, None]]
+
+REAL_MODES = frozenset({RunMode.LIVE, RunMode.AUTONOMOUS})  # real money: signals or swaps
+
+
+def runtime_home(settings: Settings) -> Path:
+    return settings.home or Path("data")
+
+
+def load_hot_wallet(settings: Settings) -> HotWallet:
+    """The hot wallet for autonomous mode. Called from the AUTONOMOUS branch only."""
+    path = arming.key_file_path(runtime_home(settings), settings.wallet.key_file)
+    if path is None:
+        raise WalletFileError("no hot wallet configured: run `solana-sniper wallet create`")
+    return load_key_file(path)
 
 
 def build_fx(settings: Settings, http: HttpClient) -> FxProvider:
@@ -125,6 +147,13 @@ def build_governor(settings: Settings, metrics: Metrics) -> ProviderGovernor:
     gov.register(host(pv.jupiter_pro_base_url), "jupiter-pro", policy(rl.jupiter_pro))
     gov.register(host(pv.coingecko_base_url), "coingecko", policy(rl.coingecko))
     gov.register(host(pv.pumpfun_api_url), "pumpfun", policy(rl.pumpfun))
+    # autonomous sends get their own bucket only when they go to a different endpoint;
+    # otherwise they share the read RPC's limits (and `arm` says so)
+    send_url = settings.autonomy.send_rpc_url
+    if send_url and host(send_url) != rpc_host:
+        send_host = host(send_url)
+        send_limit = rl.helius if "helius" in send_host else rl.solana_rpc
+        gov.register(send_host, "solana-send", policy(send_limit))
     return gov
 
 
@@ -157,6 +186,11 @@ class Runtime:
     boot: BootInfo | None = None
     paper: PaperSession | None = None
 
+    @property
+    def autonomous(self) -> AutonomousExecution | None:
+        ex = self.engine.d.execution
+        return ex if isinstance(ex, AutonomousExecution) else None
+
     async def start(self) -> None:
         self.boot = record_start(
             self.settings.state_dir, session_id=self.session_id, mode=str(self.mode)
@@ -174,10 +208,20 @@ class Runtime:
         await self._restore_account()
         # autonomous mode: intents that were signed or sent before a crash are reconciled by
         # signature before the engine ticks, so a landed swap is booked instead of forgotten
-        recover = getattr(self.engine.d.execution, "recover", None)
-        if recover is not None:
-            for line in await recover():
+        auto = self.autonomous
+        if auto is not None:
+            for line in await auto.recover():
                 log.warning("autonomous_recovery", detail=line)
+            try:
+                await auto.refresh_exposure()
+            except Exception as exc:  # the first order re-reads it; the banner says unknown
+                log.warning("wallet_balance_unavailable", error=str(exc))
+            log.warning(
+                "autonomous_mode_active",
+                wallet=auto.wallet_public_key,
+                arming=auto.arming_state().describe(),
+                wallet_lamports=auto.last_wallet_lamports,
+            )
         self.bus.start()
         for name, task in self.background:
             self._tasks.append(asyncio.create_task(task(), name=name))
@@ -434,8 +478,32 @@ def build_runtime(
         metadata, liquidity = rpc, rpc
 
     # ---- execution
+    real = mode in REAL_MODES
     execution: ExecutionInterface
-    if mode is RunMode.LIVE:
+    autonomous: AutonomousExecution | None = None
+    if mode is RunMode.AUTONOMOUS:
+        if synthetic:
+            raise ValueError(
+                "autonomous mode needs live providers; the configuration is synthetic "
+                "(discovery.sources / quotes.source)"
+            )
+        autonomous = AutonomousExecution(
+            clock,
+            settings.quotes,
+            wallet=load_hot_wallet(settings),
+            rpc=SolanaSendClient(http, settings.send_rpc_url(), clock, metrics=metrics),
+            quote_provider=quote_provider,
+            autonomy=settings.autonomy,
+            repo=repo,
+            bus=bus,
+            home=runtime_home(settings),
+            session_id=sid,
+            account=account,
+            fx=fx,
+            metrics=metrics,
+        )
+        execution = autonomous
+    elif mode is RunMode.LIVE:
         execution = ManualExecution(clock, settings.quotes)
     else:
         execution = DryRunExecution(
@@ -445,14 +513,22 @@ def build_runtime(
             auto_confirm_buys=settings.dry_run.auto_confirm_buys,
             auto_confirm_sells=settings.dry_run.auto_confirm_sells,
         )
+    # the unsigned-transaction attachment is for a human signing in their own wallet; in
+    # autonomous mode the executor builds its own fresh swap per order, so it is not prepared
     preparer = TransactionPreparer(
         quote_provider,
         clock,
         wallet_public_key=settings.providers.wallet_public_key,
-        enabled=settings.quotes.prepare_unsigned_transaction,
-        simulated=mode is not RunMode.LIVE,
+        enabled=settings.quotes.prepare_unsigned_transaction and autonomous is None,
+        simulated=not real,
         session_id=sid,
     )
+    if mode is RunMode.AUTONOMOUS:
+        execution_provenance = ExecutionProvenance.AUTONOMOUS
+    elif mode is RunMode.LIVE:
+        execution_provenance = ExecutionProvenance.MANUAL_SIGNAL
+    else:
+        execution_provenance = ExecutionProvenance.SIMULATED
 
     # ---- strategy components
     checker = TokenChecker(settings.filters)
@@ -484,14 +560,15 @@ def build_runtime(
         tracker=tracker,
         outcomes=OutcomeTracker(
             settings.outcomes,
-            simulated=mode is not RunMode.LIVE,
+            simulated=not real,
             market_data=MarketDataProvenance.SYNTHETIC if synthetic else MarketDataProvenance.LIVE,
-            execution=ExecutionProvenance.MANUAL_SIGNAL
-            if mode is RunMode.LIVE
-            else ExecutionProvenance.SIMULATED,
+            execution=execution_provenance,
         ),
         metrics=metrics,
     )
+    if autonomous is not None:
+        milestones = deps.milestones
+        autonomous.milestones_reached = lambda: sorted(milestones.reached)
     engine = Engine(settings, deps, mode=mode, session_id=sid)
     engine_holder["engine"] = engine
 

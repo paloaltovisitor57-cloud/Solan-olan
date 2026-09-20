@@ -15,9 +15,13 @@ done
 if [[ -f "$ENV_FILE" ]]; then
   perms="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode)[-3:])' "$ENV_FILE")"
   if [[ "$perms" == "600" ]]; then pass "env file: $ENV_FILE (mode 600)"; else warnc "env file $ENV_FILE has mode $perms (expected 600)"; fi
-  if grep -vE '^[[:space:]]*#' "$ENV_FILE" | grep -qiE 'PRIVATE|SECRET_KEY|SEED_PHRASE|MNEMONIC'; then warnc "env file mentions a private key/seed: this software never needs one"; fi
+  if grep -vE '^[[:space:]]*#' "$ENV_FILE" | grep -qiE 'PRIVATE|SECRET_KEY|SEED_PHRASE|MNEMONIC'; then warnc "env file mentions a private key/seed: the hot wallet key belongs in its own file under $WALLET_DIR (wallet create), never in the env file"; fi
 else
   warnc "no env file at $ENV_FILE (optional API keys not configured)"
+fi
+if [[ -d "$WALLET_DIR" ]]; then
+  wperms="$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode)[-3:])' "$WALLET_DIR")"
+  if [[ "$wperms" == "700" ]]; then pass "wallet dir: $WALLET_DIR (mode 700)"; else warnc "wallet dir $WALLET_DIR has mode $wperms (expected 700): chmod 700 '$WALLET_DIR'"; fi
 fi
 if repo_ignores_secrets "$REPO_DIR"; then pass "git ignores secrets and runtime data (.env, sniper.env, data/, logs/) and none is tracked"
 else
@@ -29,7 +33,9 @@ fi
 if is_macos; then
   if [[ -f "$PLIST_PATH" ]]; then
     if plutil -lint "$PLIST_PATH" >/dev/null 2>&1; then pass "plist valid: $PLIST_PATH"; else failc "plist invalid: $PLIST_PATH"; fi
-    if grep -q -- '--dry-run' "$PLIST_PATH"; then pass "service mode: dry-run (simulated confirmations)"; else warnc "service mode: signal (live signals; confirmations via ./cmd.sh)"; fi
+    if grep -q -- '--dry-run' "$PLIST_PATH"; then pass "service mode: dry-run (simulated confirmations)"
+    elif grep -q -- '--autonomous' "$PLIST_PATH"; then warnc "service mode: autonomous (REAL swaps from the hot wallet; stop with ./cmd.sh kill)"
+    else warnc "service mode: signal (live signals; confirmations via ./cmd.sh)"; fi
   else
     failc "plist not installed: $PLIST_PATH (run ./install-macos.sh)"
   fi

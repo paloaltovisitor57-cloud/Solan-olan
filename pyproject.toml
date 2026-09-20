@@ -76,6 +76,7 @@ ignore = ["RUF012", "SIM108", "B008", "T201", "RUF001", "RUF002", "RUF003"]
 "tests/web/seed.py" = ["E501"]
 # real-clock end-to-end run against mocked live providers: polling with sleep is intended
 "tests/integration/test_live_pipeline_mocked.py" = ["E501", "ASYNC110"]
+"tests/integration/test_autonomous_pipeline_mocked.py" = ["E501", "ASYNC110"]
 
 [tool.mypy]
 python_version = "3.12"

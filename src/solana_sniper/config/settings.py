@@ -683,3 +683,7 @@ class Settings(BaseSettings):
     @property
     def state_dir(self) -> Path:
         return (self.home / "state") if self.home else Path("data") / "state"
+
+    def send_rpc_url(self) -> str:
+        """Where autonomous mode sends transactions: its own endpoint, else the read RPC."""
+        return self.autonomy.send_rpc_url or self.providers.solana_rpc_url

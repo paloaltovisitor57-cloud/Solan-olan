@@ -27,7 +27,8 @@ from solana_sniper.telemetry.logging import configure_logging
 from solana_sniper.telemetry.redaction import safe_url
 
 app = typer.Typer(
-    help="Live Solana new-token sniper: discover, score, size, confirm manually.",
+    help="Live Solana new-token sniper: discover, score, size, then confirm manually or trade "
+    "autonomously from a dedicated hot wallet.",
     no_args_is_help=True,
 )
 console = Console()
@@ -104,6 +105,13 @@ def run(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Live data, simulated confirmations/fills")
     ] = False,
+    autonomous: Annotated[
+        bool,
+        typer.Option(
+            "--autonomous",
+            help="Sign and broadcast real swaps from the hot wallet (needs `wallet create` + `arm`)",
+        ),
+    ] = False,
     no_dashboard: Annotated[
         bool, typer.Option("--no-dashboard", help="Plain log output instead of the TUI")
     ] = False,
@@ -115,9 +123,19 @@ def run(
         bool, typer.Option("--quiet", help="No per-event stdout (service mode)")
     ] = False,
 ) -> None:
-    """Start the live engine (signal mode) or --dry-run (same engine, simulated confirmations)."""
+    """Start the engine: signal mode (default), --dry-run (simulated confirmations) or
+    --autonomous (real swaps from the hot wallet, within the armed caps)."""
+    if dry_run and autonomous:
+        console.print("[red]--dry-run and --autonomous are mutually exclusive[/]")
+        raise typer.Exit(code=2)
     settings = load_settings(config)
-    mode = RunMode.DRY_RUN if dry_run else RunMode.LIVE
+    if autonomous:
+        from solana_sniper.cli.autonomy import preflight
+
+        preflight(settings)
+        mode = RunMode.AUTONOMOUS
+    else:
+        mode = RunMode.DRY_RUN if dry_run else RunMode.LIVE
     use_dashboard = settings.dashboard.enabled and not no_dashboard and not quiet
     configure_logging(
         settings.telemetry.log_level,
@@ -188,6 +206,8 @@ async def _run(
         console.print(
             "[bold red]LIVE SIGNAL MODE[/]: nothing is signed or broadcast. Confirm with b N / s N."
         )
+    elif mode is RunMode.AUTONOMOUS:
+        _print_autonomous_banner(runtime)
     handler = CommandHandler(runtime.engine, stop.set, say)
     reader = StdinReader()
     tasks: list[asyncio.Task[None]] = []
@@ -249,6 +269,41 @@ async def _run(
                     f"{k}={v.summary()}" for k, v in lat.items() if v.summary().get("count")
                 )
             )
+
+
+def _print_autonomous_banner(runtime: object) -> None:
+    from solana_sniper.app.bootstrap import Runtime
+
+    assert isinstance(runtime, Runtime)
+    auto = runtime.autonomous
+    assert auto is not None
+    caps = auto.caps()
+    state = auto.arming_state()
+    balance = (
+        f"{Decimal(auto.last_wallet_lamports) / Decimal(10**9):.4f} SOL"
+        if auto.last_wallet_lamports is not None
+        else "unknown (RPC unavailable)"
+    )
+    console.print()
+    console.print(
+        "[bold red]LIVE AUTONOMOUS MODE[/]: this process signs and broadcasts real swaps."
+    )
+    console.print(f"wallet:      {auto.wallet_public_key}   balance {balance}", highlight=False)
+    console.print(f"arming:      {state.describe()}", highlight=False)
+    console.print(
+        f"caps:        per trade <= {caps['max_trade_sol']} SOL   per day <= "
+        f"{caps['max_daily_spend_sol']} SOL   open positions <= {caps['max_open_positions']}   "
+        f"reserve {caps['reserve_sol']} SOL",
+        highlight=False,
+    )
+    console.print(
+        "fills:       booked only from confirmed transactions (verified on-chain); "
+        "b N / s N do not apply",
+    )
+    console.print(
+        "stop:        solana-sniper kill (buys+sells)   solana-sniper disarm (buys)   Ctrl+C"
+    )
+    console.print()
 
 
 def _print_paper_banner(paper: object, runtime: object) -> None:
@@ -612,6 +667,10 @@ service_app = typer.Typer(
 )
 app.add_typer(service_app, name="service")
 
+from solana_sniper.cli import autonomy as _autonomy_cli  # noqa: E402  (needs `app`)
+
+_autonomy_cli.register(app)  # wallet create|import|show, arm, disarm, kill, resume
+
 
 def _script(name: str, *args: str) -> None:
     from solana_sniper.app.repo_safety import repo_root_from_package
@@ -703,9 +762,12 @@ def status(
         counts = await repo.counts()
         sessions = await repo.list_sessions(limit=3)
         await repo.close()
+        from solana_sniper.cli.autonomy import wallet_report
         from solana_sniper.config.settings import Settings
 
         assert isinstance(settings, Settings)
+        autonomy = wallet_report(settings, with_balance=False)
+        autonomous_seen = any(s.get("mode") == "AUTONOMOUS" for s in sessions)
         if json_output:
             payload = {
                 "home": str(settings.home),
@@ -713,6 +775,7 @@ def status(
                 "config": str(settings.config_path) if settings.config_path else None,
                 "counts": counts,
                 "sessions": sessions,
+                "autonomy": autonomy,
                 "portfolio": None
                 if snap is None
                 else {
@@ -728,13 +791,20 @@ def status(
             print(json.dumps(payload, default=str))
             return
         console.print(_context_line(settings))
+        if autonomy["key_file"] or autonomy["disarmed_reason"] or autonomy["kill_switch"]:
+            console.print(
+                f"autonomy: {autonomy['arming']}  wallet {autonomy['public_key'] or 'unreadable'}",
+                highlight=False,
+            )
         if snap is None:
             console.print("no portfolio snapshot yet")
         else:
-            table = Table(
-                title=f"portfolio @ {snap.at:%Y-%m-%d %H:%M:%S}  "
-                "(simulated / quote-estimated / user-reported records; not on-chain verified)"
+            basis = (
+                "autonomous fills are read back from the chain; open values are quote estimates"
+                if autonomous_seen
+                else "simulated / quote-estimated / user-reported records; not on-chain verified"
             )
+            table = Table(title=f"portfolio @ {snap.at:%Y-%m-%d %H:%M:%S}  ({basis})")
             table.add_column("metric")
             table.add_column("value", justify="right")
             for k, v in (
@@ -1242,6 +1312,21 @@ def _print_health(status: dict[str, object], fresh: bool, healthy: bool) -> None
     )
     table.add_row("session", str(status.get("session_id")))
     table.add_row("uptime", f"{uptime / 60:.1f} min" if isinstance(uptime, int | float) else "?")
+    auto = status.get("autonomy")
+    if isinstance(auto, dict):
+        flag = (
+            "[red]KILL[/]"
+            if auto.get("kill_switch")
+            else ("[green]armed[/]" if auto.get("armed") else "[yellow]disarmed[/]")
+        )
+        table.add_row(
+            "autonomy",
+            f"{flag} {auto.get('state')}  wallet {str(auto.get('wallet_public_key'))[:8]}…  "
+            f"balance {auto.get('wallet_sol') or '?'} SOL  spent today {auto.get('spent_today_sol')} SOL  "
+            f"loss {auto.get('loss_sol') or '?'} / {auto.get('max_total_loss_sol') or '?'} SOL  "
+            f"in flight {auto.get('intents_in_flight')}  sends {auto.get('sends')}  "
+            f"confirmed {auto.get('confirmed')}  failed {auto.get('failed')}",
+        )
     for label, key in (("problems", "problems"), ("degraded", "degraded")):
         items = status.get(key) or []
         if isinstance(items, list) and items:
@@ -1305,6 +1390,7 @@ def _print_health(status: dict[str, object], fresh: bool, healthy: bool) -> None
     lines = [
         f"{p.get('symbol') or str(p.get('mint', ''))[:8]} cost €{p.get('cost_eur')} value €{p.get('value_eur')} "
         f"pnl {float(p.get('pnl_pct', 0)):+.0%} held {p.get('held_s')}s{' (stale data)' if p.get('data_stale') else ''}"
+        f"{' (verified on-chain)' if p.get('verified_onchain') else ''}"
         for p in positions
     ]
     table.add_row("open positions", "\n".join(lines) or "none")

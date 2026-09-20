@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-time macOS setup: python check → venv → deps → dirs → config → tests → launchd service.
-# Re-runnable. Usage: ./install-macos.sh [--skip-tests] [--skip-service] [--no-path] [--mode dry-run|signal]
+# Re-runnable. Usage: ./install-macos.sh [--skip-tests] [--skip-service] [--no-path] [--mode dry-run|signal|autonomous]
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/scripts/common.sh"
 
 SKIP_TESTS=0; SKIP_SERVICE=0; MODE_OVERRIDE=""; NO_PATH=0
@@ -42,7 +42,7 @@ pip_install -e "${REPO_DIR}[dev,web]"
 ensure_dirs
 ensure_env_file
 if [[ -n "$MODE_OVERRIDE" ]]; then
-  case "$MODE_OVERRIDE" in dry-run|signal) ;; *) fail "--mode must be dry-run or signal" ;; esac
+  case "$MODE_OVERRIDE" in dry-run|signal|autonomous) ;; *) fail "--mode must be dry-run, signal or autonomous" ;; esac
   if grep -qE '^SNIPER_SERVICE_MODE=' "$ENV_FILE"; then
     tmp="$(mktemp)"; sed "s/^SNIPER_SERVICE_MODE=.*/SNIPER_SERVICE_MODE=$MODE_OVERRIDE/" "$ENV_FILE" > "$tmp" && mv "$tmp" "$ENV_FILE"; chmod 600 "$ENV_FILE"
   else
@@ -50,7 +50,10 @@ if [[ -n "$MODE_OVERRIDE" ]]; then
   fi
 fi
 load_service_mode
-info "service mode: $SNIPER_SERVICE_MODE (dry-run = live data, simulated confirmations; signal = human confirms via ./cmd.sh)"
+info "service mode: $(describe_service_mode)"
+if [[ "$SNIPER_SERVICE_MODE" == "autonomous" ]]; then
+  warn "autonomous mode signs real transactions; the service only starts once 'solana-sniper wallet create' and 'solana-sniper arm --max-loss-sol <n>' have been run"
+fi
 info "state: db=$DB_DIR logs=$LOG_DIR state=$STATE_DIR"
 
 # 5. configuration + database schema

@@ -237,6 +237,10 @@ class AutonomousExecution(ManualExecution):
         self.failed = 0
         self.last_send_at: datetime | None = None
         self.last_confirmed_at: datetime | None = None
+        # last exposure the rails saw (heartbeat / dashboard); None until the first order
+        self.last_wallet_lamports: int | None = None
+        self.last_loss_lamports: int | None = None
+        self.last_exposure_at: datetime | None = None
 
     # ------------------------------------------------------------ properties
     @property
@@ -252,6 +256,27 @@ class AutonomousExecution(ManualExecution):
 
     def arming_state(self) -> arming.ArmingState:
         return arming.read(self._home)
+
+    @property
+    def armed_by_config(self) -> bool:
+        """The configuration half of "armed": the markers are the other half."""
+        return self._cfg.enabled and self._cfg.acknowledge_real_money
+
+    def caps(self) -> dict[str, Any]:
+        """The caps in force, for the heartbeat and the start banner (all public values)."""
+        c = self._cfg
+        return {
+            "max_trade_sol": str(c.max_trade_sol),
+            "max_daily_spend_sol": str(c.max_daily_spend_sol),
+            "max_total_loss_sol": str(c.max_total_loss_sol) if c.max_total_loss_sol else None,
+            "max_open_positions": c.max_open_positions,
+            "reserve_sol": str(c.reserve_sol),
+            "max_slippage_bps": c.max_slippage_bps,
+            "max_price_impact_pct": c.max_price_impact_pct,
+            "max_priority_fee_lamports": c.max_priority_fee_lamports,
+            "confirm_timeout_s": c.confirm_timeout_s,
+            "exits_continue_when_disarmed": c.exits_continue_when_disarmed,
+        }
 
     # --------------------------------------------------------------- decide
     async def decide(
@@ -393,19 +418,22 @@ class AutonomousExecution(ManualExecution):
             else wallet_lamports
         )
         armed = state.armed and self._cfg.enabled and self._cfg.acknowledge_real_money
-        return (
-            Exposure(
-                armed=armed,
-                kill=state.kill,
-                wallet_lamports=wallet_lamports,
-                open_positions=len(self._account.open_positions),
-                spent_today_lamports=self.spent_today_lamports(),
-                loss_lamports=SafetyRails.loss_lamports(
-                    start, wallet_lamports, open_value_lamports
-                ),
-            ),
-            state,
+        exposure = Exposure(
+            armed=armed,
+            kill=state.kill,
+            wallet_lamports=wallet_lamports,
+            open_positions=len(self._account.open_positions),
+            spent_today_lamports=self.spent_today_lamports(),
+            loss_lamports=SafetyRails.loss_lamports(start, wallet_lamports, open_value_lamports),
         )
+        self.last_wallet_lamports = wallet_lamports
+        self.last_loss_lamports = exposure.loss_lamports
+        self.last_exposure_at = self._clock.now()
+        return exposure, state
+
+    async def refresh_exposure(self) -> None:
+        """Read the wallet balance for the heartbeat (the CLI banner and health use it)."""
+        await self._exposure()
 
     def _failure_kind(self, order: PendingOrder) -> DecisionKind:
         return DecisionKind.REJECT if order.kind is SignalKind.BUY else DecisionKind.IGNORE

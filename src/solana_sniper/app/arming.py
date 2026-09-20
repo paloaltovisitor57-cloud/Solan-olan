@@ -23,7 +23,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-from solana_sniper.config.paths import ARMED_FILE, DISARMED_FILE, KILL_FILE, STATE_DIR
+from solana_sniper.config.paths import (
+    ARMED_FILE,
+    DISARMED_FILE,
+    KILL_FILE,
+    STATE_DIR,
+    wallet_key_path,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,6 +61,31 @@ class ArmingState:
 
 def _state_dir(home: Path) -> Path:
     return home / STATE_DIR
+
+
+def key_file_path(home: Path, configured: str | None) -> Path | None:
+    """Where the hot wallet key file is: `wallet.key_file` (relative paths resolve under the
+    runtime home), else the default location if a wallet was created there, else None."""
+    if configured:
+        p = Path(configured).expanduser()
+        return p if p.is_absolute() else home / p
+    default = wallet_key_path(home)
+    return default if default.exists() else None
+
+
+def start_blockers(
+    *, enabled: bool, acknowledged: bool, key_file: str | None, state: ArmingState
+) -> list[str]:
+    """What stops `run --autonomous` from starting at all. A disarmed or killed state is not
+    in this list: the process still starts so exits can continue and `resume` can lift KILL."""
+    problems: list[str] = []
+    if not key_file:
+        problems.append("no hot wallet: run `solana-sniper wallet create`")
+    if not enabled or not acknowledged:
+        problems.append("autonomy is not enabled: run `solana-sniper arm --max-loss-sol <amount>`")
+    if not state.armed_marker and state.disarmed_reason is None:
+        problems.append("never armed: run `solana-sniper arm --max-loss-sol <amount>`")
+    return problems
 
 
 def _write_json(path: Path, data: dict[str, Any]) -> None:
